@@ -10,7 +10,6 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from dotenv import load_dotenv
-import keyring
 import msal
 import requests
 import rumps
@@ -29,10 +28,6 @@ REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
 # Proxy config
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "18765"))
 VOITTA_RAG_URL = os.environ.get("VOITTA_RAG_URL", "https://rag.voitta.ai")
-
-# Keychain config
-KEYRING_SERVICE = "voitta-auth"
-KEYRING_CACHE_KEY = "msal-token-cache"
 
 # Settings file
 SETTINGS_PATH = Path.home() / ".voitta_auth_settings.json"
@@ -192,16 +187,9 @@ class VoittaAuthApp(rumps.App):
         self._tenant_id = self._settings.get("tenant_id") or TENANT_ID
         self._client_id = self._settings.get("client_id") or CLIENT_ID
 
-        # Persistent MSAL app with serializable token cache (stored in OS keychain)
-        self._token_cache = msal.SerializableTokenCache()
-        cached = keyring.get_password(KEYRING_SERVICE, KEYRING_CACHE_KEY)
-        if cached:
-            self._token_cache.deserialize(cached)
-
         self._msal_app = msal.PublicClientApplication(
             self._client_id,
             authority=f"https://login.microsoftonline.com/{self._tenant_id}",
-            token_cache=self._token_cache,
         )
 
         self.menu = [
@@ -213,9 +201,6 @@ class VoittaAuthApp(rumps.App):
         ]
         self._update_menu_state()
 
-        # Try to restore session from cached refresh token
-        threading.Thread(target=self._try_silent_auth, daemon=True).start()
-
         # Start MCP proxy server
         threading.Thread(target=self._run_proxy, daemon=True).start()
 
@@ -224,26 +209,7 @@ class VoittaAuthApp(rumps.App):
         self._msal_app = msal.PublicClientApplication(
             self._client_id,
             authority=f"https://login.microsoftonline.com/{self._tenant_id}",
-            token_cache=self._token_cache,
         )
-
-    def _save_cache(self):
-        if self._token_cache.has_state_changed:
-            keyring.set_password(KEYRING_SERVICE, KEYRING_CACHE_KEY, self._token_cache.serialize())
-
-    def _try_silent_auth(self):
-        """Restore session silently from cached refresh token on startup."""
-        accounts = self._msal_app.get_accounts()
-        if not accounts:
-            return
-        result = self._msal_app.acquire_token_silent(SCOPES, account=accounts[0])
-        if result and "access_token" in result:
-            self.token = result["access_token"]
-            self._fetch_profile()
-            self._save_cache()
-            self._schedule_refresh(result.get("expires_in", 3600))
-            self._update_menu_state()
-            print("[voitta-auth] Session restored from cache")
 
     def _schedule_refresh(self, expires_in):
         """Schedule a proactive token refresh 5 minutes before expiry."""
@@ -263,7 +229,6 @@ class VoittaAuthApp(rumps.App):
         result = self._msal_app.acquire_token_silent(SCOPES, account=accounts[0], force_refresh=True)
         if result and "access_token" in result:
             self.token = result["access_token"]
-            self._save_cache()
             self._schedule_refresh(result.get("expires_in", 3600))
             print("[voitta-auth] Token refreshed silently")
         else:
@@ -316,7 +281,6 @@ class VoittaAuthApp(rumps.App):
             if "access_token" in result:
                 self.token = result["access_token"]
                 self._fetch_profile()
-                self._save_cache()
                 self._schedule_refresh(result.get("expires_in", 3600))
                 name = self.profile.get("displayName", "Unknown") if self.profile else "Unknown"
                 print(f"[voitta-auth] Authenticated as {name}")
@@ -351,10 +315,6 @@ class VoittaAuthApp(rumps.App):
             self._refresh_timer = None
         for account in self._msal_app.get_accounts():
             self._msal_app.remove_account(account)
-        try:
-            keyring.delete_password(KEYRING_SERVICE, KEYRING_CACHE_KEY)
-        except keyring.errors.PasswordDeleteError:
-            pass
         self.token = None
         self.profile = None
         _notify("Voitta Auth", "Signed out", "Token cleared.")
@@ -482,11 +442,6 @@ class VoittaAuthApp(rumps.App):
                 self._refresh_timer = None
             for account in self._msal_app.get_accounts():
                 self._msal_app.remove_account(account)
-            try:
-                keyring.delete_password(KEYRING_SERVICE, KEYRING_CACHE_KEY)
-            except keyring.errors.PasswordDeleteError:
-                pass
-            self._token_cache = msal.SerializableTokenCache()
             self.token = None
             self.profile = None
             self._rebuild_msal_app()
