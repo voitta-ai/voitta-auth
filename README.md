@@ -4,8 +4,8 @@ A macOS menu bar application that authenticates users via multiple identity prov
 
 ## How It Works
 
-1. Sits in the macOS menu bar with a 3-sector status indicator: `V ○○○` (none authenticated) through `V ●●●` (all three)
-2. Each provider can be activated/deactivated independently — sectors correspond to Microsoft, Google, Okta (left to right)
+1. Sits in the macOS menu bar showing `M G O` — each letter represents a provider (Microsoft, Google, Okta). Bright when authenticated, dimmed when not. Adapts to the system light/dark theme
+2. Each provider can be activated/deactivated independently
 3. On activation, opens the provider's login page in the browser and captures the OAuth2 callback
 4. Runs a local HTTP proxy (default `http://127.0.0.1:18765`) that forwards requests to voitta-rag, injecting auth headers for **all** authenticated providers simultaneously
 5. Tokens are held in memory and refreshed automatically while the app is running

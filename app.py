@@ -17,6 +17,10 @@ from dotenv import load_dotenv
 import msal
 import requests
 import rumps
+from AppKit import (
+    NSAttributedString, NSColor, NSFont, NSFontAttributeName,
+    NSForegroundColorAttributeName, NSMutableAttributedString,
+)
 from Foundation import NSObject, NSTimer, NSRunLoop
 
 load_dotenv()
@@ -60,6 +64,7 @@ PROVIDERS = {
 }
 
 PROVIDER_ORDER = ("microsoft", "google", "okta")
+PROVIDER_LETTERS = {"microsoft": "M", "google": "G", "okta": "O"}
 
 # ── Global config ────────────────────────────────────────────────────────────
 
@@ -253,7 +258,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 class VoittaAuthApp(rumps.App):
     def __init__(self):
-        super().__init__("Voitta", title="V ○ ○ ○")
+        super().__init__("Voitta", title="M G O")
 
         self._auth_lock = threading.Lock()
         self._auth = {}
@@ -302,13 +307,46 @@ class VoittaAuthApp(rumps.App):
     # ── Menu state ───────────────────────────────────────────────────────────
 
     def _build_title(self):
-        indicators = []
-        for key in PROVIDER_ORDER:
-            indicators.append("●" if self._auth[key]["token"] else "○")
-        return "V " + " ".join(indicators)
+        return " ".join(PROVIDER_LETTERS[k] for k in PROVIDER_ORDER)
+
+    def _apply_attributed_title(self):
+        """Set menu bar title with dimmed/bright letters respecting system theme."""
+        try:
+            button = self._nsapp.nsstatusitem.button()
+        except AttributeError:
+            return
+        is_dark = "Dark" in str(button.effectiveAppearance().name())
+        base = 1.0 if is_dark else 0.0
+        font = NSFont.menuBarFontOfSize_(0)
+        title = NSMutableAttributedString.alloc().init()
+        for i, key in enumerate(PROVIDER_ORDER):
+            if i > 0:
+                space = NSAttributedString.alloc().initWithString_attributes_(
+                    " ", {NSFontAttributeName: font}
+                )
+                title.appendAttributedString_(space)
+            active = self._auth[key]["token"] is not None
+            alpha = 1.0 if active else 0.4
+            color = NSColor.colorWithCalibratedWhite_alpha_(base, alpha)
+            attrs = {
+                NSForegroundColorAttributeName: color,
+                NSFontAttributeName: font,
+            }
+            char = NSAttributedString.alloc().initWithString_attributes_(
+                PROVIDER_LETTERS[key], attrs
+            )
+            title.appendAttributedString_(char)
+        button.setAttributedTitle_(title)
+
+    @rumps.timer(0.1)
+    def _startup_title(self, timer):
+        """Apply attributed title once the status bar is ready."""
+        self._apply_attributed_title()
+        timer.stop()
 
     def _update_menu_state(self):
         self.title = self._build_title()
+        self._apply_attributed_title()
         for key in PROVIDER_ORDER:
             label = PROVIDERS[key]["label"]
             item = self._menu_items[key]
@@ -815,8 +853,8 @@ class VoittaAuthApp(rumps.App):
         alert.setMessageText_("Voitta Auth Help")
         alert.setInformativeText_(
             "Voitta Auth sits in your menu bar.\n\n"
-            "Status: V [M] [G] [O]\n"
-            "  ● = authenticated  ○ = not authenticated\n\n"
+            "Status: M G O\n"
+            "  Bright = authenticated, dimmed = not authenticated\n\n"
             "Activate/Deactivate each provider independently.\n"
             "All authenticated providers inject headers into the proxy.\n\n"
             f"Proxy: http://127.0.0.1:{PROXY_PORT} → {self.voitta_rag_url}"
