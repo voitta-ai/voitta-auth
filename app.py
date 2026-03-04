@@ -18,8 +18,9 @@ import msal
 import requests
 import rumps
 from AppKit import (
-    NSAttributedString, NSColor, NSFont, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSMutableAttributedString,
+    NSAttributedString, NSBezierPath, NSColor, NSFont, NSFontAttributeName,
+    NSForegroundColorAttributeName, NSImage, NSMutableAttributedString,
+    NSTextAttachment, NSTextAttachmentCell,
 )
 from Foundation import NSObject, NSTimer, NSRunLoop
 
@@ -66,12 +67,62 @@ PROVIDERS = {
 PROVIDER_ORDER = ("microsoft", "google", "okta")
 PROVIDER_LETTERS = {"microsoft": "M", "google": "G", "okta": "O"}
 
+# ── Edit provider registry ──────────────────────────────────────────────────
+
+EDIT_PROVIDERS = {
+    "microsoft_edit": {
+        "label": "Microsoft Edit",
+        "letter": "M",
+        "settings_fields": [
+            ("ms_edit_tenant_id", "Tenant ID:"),
+            ("ms_edit_client_id", "Client ID:"),
+        ],
+        "settings_defaults_from": {
+            "ms_edit_tenant_id": "ms_tenant_id",
+            "ms_edit_client_id": "ms_client_id",
+        },
+        "env_defaults": {
+            "ms_edit_tenant_id": "AZURE_TENANT_ID",
+            "ms_edit_client_id": "AZURE_CLIENT_ID",
+        },
+        "scopes": ["User.Read", "Files.ReadWrite.All", "Sites.ReadWrite.All"],
+    },
+    "google_edit": {
+        "label": "Google Edit",
+        "letter": "G",
+        "settings_fields": [
+            ("google_edit_client_id", "Client ID:"),
+            ("google_edit_client_secret", "Client Secret:"),
+        ],
+        "settings_defaults_from": {
+            "google_edit_client_id": "google_client_id",
+            "google_edit_client_secret": "google_client_secret",
+        },
+        "env_defaults": {
+            "google_edit_client_id": "GOOGLE_CLIENT_ID",
+            "google_edit_client_secret": "GOOGLE_CLIENT_SECRET",
+        },
+        "scopes": (
+            "openid email profile"
+            " https://www.googleapis.com/auth/spreadsheets"
+            " https://www.googleapis.com/auth/documents"
+            " https://www.googleapis.com/auth/presentations"
+            " https://www.googleapis.com/auth/drive"
+        ),
+    },
+}
+
+EDIT_PROVIDER_ORDER = ("microsoft_edit", "google_edit")
+
 # ── Global config ────────────────────────────────────────────────────────────
 
 REDIRECT_PORT = int(os.environ.get("REDIRECT_PORT", "53214"))
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "18765"))
+EDIT_PROXY_PORT = int(os.environ.get("EDIT_PROXY_PORT", "18766"))
 VOITTA_RAG_URL = os.environ.get("VOITTA_RAG_URL", "https://rag.voitta.ai")
+EDIT_PROXY_URL = os.environ.get("EDIT_PROXY_URL", "http://localhost:8000")
+EDIT_MCP_ENV_PATH = os.environ.get("EDIT_MCP_ENV_PATH", os.path.expanduser("~/DEVEL/google_workspace_mcp/.env"))
 SETTINGS_PATH = Path.home() / ".voitta_auth_settings.json"
 
 # Hop-by-hop headers that must not be forwarded
@@ -90,6 +141,29 @@ def _pkce_pair():
         hashlib.sha256(verifier.encode()).digest()
     ).rstrip(b"=").decode()
     return verifier, challenge
+
+
+def _circled_letter_image(letter, size, color):
+    """Create an NSImage of a letter inside a circle, for menu bar use."""
+    img = NSImage.alloc().initWithSize_((size, size))
+    img.lockFocus()
+    circle_rect = ((1, 1), (size - 2, size - 2))
+    path = NSBezierPath.bezierPathWithOvalInRect_(circle_rect)
+    color.set()
+    path.setLineWidth_(1.2)
+    path.stroke()
+    font = NSFont.menuBarFontOfSize_(size * 0.5)
+    attrs = {
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: color,
+    }
+    text = NSAttributedString.alloc().initWithString_attributes_(letter, attrs)
+    text_size = text.size()
+    x = (size - text_size.width) / 2
+    y = (size - text_size.height) / 2
+    text.drawAtPoint_((x, y))
+    img.unlockFocus()
+    return img
 
 
 def _notify(title, subtitle, message):
@@ -254,6 +328,94 @@ class ProxyHandler(BaseHTTPRequestHandler):
         pass
 
 
+class EditProxyHandler(BaseHTTPRequestHandler):
+    """HTTP proxy that injects edit auth tokens as standard Authorization headers."""
+
+    voitta_app = None
+
+    def _proxy(self):
+        app = self.__class__.voitta_app
+        base_url = app.edit_proxy_url if app else EDIT_PROXY_URL
+        target_url = base_url.rstrip("/") + self.path
+        print(f"[edit-proxy] {self.command} {self.path} → {target_url}")
+
+        headers = {
+            k: v for k, v in self.headers.items()
+            if k.lower() not in HOP_BY_HOP and k.lower() != "host"
+        }
+
+        # Inject Authorization: Bearer from the first available edit provider
+        injected = False
+        if app:
+            for key in EDIT_PROVIDER_ORDER:
+                state = app._auth[key]
+                if state["token"]:
+                    headers["Authorization"] = f"Bearer {state['token']}"
+                    if state["profile"]:
+                        headers["X-Auth-Email"] = state["profile"].get("email", "")
+                        headers["X-Auth-Name"] = state["profile"].get("name", "")
+                    injected = True
+                    print(f"[edit-proxy] {key} auth injected")
+                    break
+
+        if not injected:
+            print("[edit-proxy] WARNING: no edit tokens available, forwarding unauthenticated")
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length else None
+        if body:
+            print(f"[edit-proxy] body ({content_length}b): {body[:200]}")
+
+        try:
+            resp = requests.request(
+                self.command, target_url,
+                headers=headers, data=body,
+                stream=True, timeout=(10, None),
+            )
+        except Exception as e:
+            print(f"[edit-proxy] ERROR connecting to upstream: {e}")
+            self.send_error(502, f"Proxy error: {e}")
+            return
+
+        print(f"[edit-proxy] upstream response: {resp.status_code} {resp.reason}")
+        if resp.status_code >= 400:
+            print(f"[edit-proxy] upstream headers: {dict(resp.headers)}")
+            body_preview = resp.content[:500]
+            print(f"[edit-proxy] upstream error body: {body_preview}")
+            self.send_response(resp.status_code)
+            for k, v in resp.headers.items():
+                if k.lower() not in HOP_BY_HOP:
+                    self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body_preview)
+            return
+
+        self.send_response(resp.status_code)
+        for k, v in resp.headers.items():
+            if k.lower() not in HOP_BY_HOP:
+                self.send_header(k, v)
+        self.end_headers()
+
+        try:
+            for chunk in resp.iter_content(chunk_size=None):
+                if chunk:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_GET(self): self._proxy()
+    def do_POST(self): self._proxy()
+    def do_PUT(self): self._proxy()
+    def do_DELETE(self): self._proxy()
+    def do_PATCH(self): self._proxy()
+    def do_HEAD(self): self._proxy()
+    def do_OPTIONS(self): self._proxy()
+
+    def log_message(self, format, *args):
+        pass
+
+
 # ── Main application ─────────────────────────────────────────────────────────
 
 class VoittaAuthApp(rumps.App):
@@ -270,12 +432,23 @@ class VoittaAuthApp(rumps.App):
                 "refresh_timer": None,
                 "msal_app": None,
             }
+        for key in EDIT_PROVIDER_ORDER:
+            self._auth[key] = {
+                "token": None,
+                "refresh_token": None,
+                "profile": None,
+                "refresh_timer": None,
+                "msal_app": None,
+            }
 
         ProxyHandler.voitta_app = self
+        EditProxyHandler.voitta_app = self
 
         # Load persistent settings
         self._settings = self._load_settings()
         self.voitta_rag_url = self._settings.get("voitta_rag_url", VOITTA_RAG_URL)
+        self.edit_proxy_url = self._settings.get("edit_proxy_url", EDIT_PROXY_URL)
+        self.edit_mcp_env_path = self._settings.get("edit_mcp_env_path", EDIT_MCP_ENV_PATH)
 
         # Load per-provider credentials from settings (fall back to env vars)
         for key, cfg in PROVIDERS.items():
@@ -283,8 +456,20 @@ class VoittaAuthApp(rumps.App):
                 if settings_key not in self._settings:
                     self._settings[settings_key] = os.environ.get(env_var, "")
 
-        # Initialize MSAL for Microsoft
+        # Load edit provider credentials (fall back to env vars, then base provider)
+        for key, cfg in EDIT_PROVIDERS.items():
+            for settings_key, env_var in cfg["env_defaults"].items():
+                if settings_key not in self._settings:
+                    env_val = os.environ.get(env_var, "")
+                    base_key = cfg["settings_defaults_from"].get(settings_key, "")
+                    self._settings[settings_key] = env_val or self._settings.get(base_key, "")
+
+        # Initialize MSAL for Microsoft (read + edit)
         self._rebuild_msal_app()
+        self._rebuild_msal_app_edit()
+
+        # Sync Google Edit credentials to the workspace MCP server's .env
+        self._sync_edit_mcp_env()
 
         # Build menu with direct references
         self._menu_items = {}
@@ -295,14 +480,21 @@ class VoittaAuthApp(rumps.App):
             self._menu_items[key] = item
             menu_list.append(item)
         menu_list.append(None)  # separator
+        for key in EDIT_PROVIDER_ORDER:
+            label = EDIT_PROVIDERS[key]["label"]
+            item = rumps.MenuItem(f"Activate {label}", callback=self._make_edit_toggle_callback(key))
+            self._menu_items[key] = item
+            menu_list.append(item)
+        menu_list.append(None)  # separator
         menu_list.append(rumps.MenuItem("Settings", callback=self.show_settings))
         menu_list.append(rumps.MenuItem("Help", callback=self.show_help))
         self.menu = menu_list
 
         self._update_menu_state()
 
-        # Start MCP proxy server
+        # Start MCP proxy servers
         threading.Thread(target=self._run_proxy, daemon=True).start()
+        threading.Thread(target=self._run_edit_proxy, daemon=True).start()
 
     # ── Menu state ───────────────────────────────────────────────────────────
 
@@ -310,7 +502,7 @@ class VoittaAuthApp(rumps.App):
         return " ".join(PROVIDER_LETTERS[k] for k in PROVIDER_ORDER)
 
     def _apply_attributed_title(self):
-        """Set menu bar title with dimmed/bright letters respecting system theme."""
+        """Set menu bar title with dimmed/bright letters + circled edit indicators."""
         try:
             button = self._nsapp.nsstatusitem.button()
         except AttributeError:
@@ -319,6 +511,8 @@ class VoittaAuthApp(rumps.App):
         base = 1.0 if is_dark else 0.0
         font = NSFont.menuBarFontOfSize_(0)
         title = NSMutableAttributedString.alloc().init()
+
+        # RAG provider letters (M G O)
         for i, key in enumerate(PROVIDER_ORDER):
             if i > 0:
                 space = NSAttributedString.alloc().initWithString_attributes_(
@@ -336,6 +530,34 @@ class VoittaAuthApp(rumps.App):
                 PROVIDER_LETTERS[key], attrs
             )
             title.appendAttributedString_(char)
+
+        # Edit provider circled letters
+        any_edit = any(self._has_edit_credentials(k) for k in EDIT_PROVIDER_ORDER)
+        if any_edit:
+            space = NSAttributedString.alloc().initWithString_attributes_(
+                "  ", {NSFontAttributeName: font}
+            )
+            title.appendAttributedString_(space)
+
+            icon_size = font.pointSize() + 2
+            for j, key in enumerate(EDIT_PROVIDER_ORDER):
+                if not self._has_edit_credentials(key):
+                    continue
+                if j > 0:
+                    sp = NSAttributedString.alloc().initWithString_attributes_(
+                        " ", {NSFontAttributeName: font}
+                    )
+                    title.appendAttributedString_(sp)
+                active = self._auth[key]["token"] is not None
+                alpha = 1.0 if active else 0.4
+                color = NSColor.colorWithCalibratedWhite_alpha_(base, alpha)
+                img = _circled_letter_image(EDIT_PROVIDERS[key]["letter"], icon_size, color)
+                attachment = NSTextAttachment.alloc().init()
+                cell = NSTextAttachmentCell.alloc().initImageCell_(img)
+                attachment.setAttachmentCell_(cell)
+                img_str = NSAttributedString.attributedStringWithAttachment_(attachment)
+                title.appendAttributedString_(img_str)
+
         button.setAttributedTitle_(title)
 
     @rumps.timer(0.1)
@@ -344,11 +566,29 @@ class VoittaAuthApp(rumps.App):
         self._apply_attributed_title()
         timer.stop()
 
+    def _has_edit_credentials(self, key):
+        """Return True if the edit provider has required credentials configured."""
+        cfg = EDIT_PROVIDERS[key]
+        for settings_key, _ in cfg["settings_fields"]:
+            val = self._settings.get(settings_key, "")
+            if not val:
+                base_key = cfg["settings_defaults_from"].get(settings_key, "")
+                if not self._settings.get(base_key, ""):
+                    return False
+        return True
+
     def _update_menu_state(self):
         self.title = self._build_title()
         self._apply_attributed_title()
         for key in PROVIDER_ORDER:
             label = PROVIDERS[key]["label"]
+            item = self._menu_items[key]
+            if self._auth[key]["token"]:
+                item.title = f"Deactivate {label}"
+            else:
+                item.title = f"Activate {label}"
+        for key in EDIT_PROVIDER_ORDER:
+            label = EDIT_PROVIDERS[key]["label"]
             item = self._menu_items[key]
             if self._auth[key]["token"]:
                 item.title = f"Deactivate {label}"
@@ -365,6 +605,16 @@ class VoittaAuthApp(rumps.App):
                 ).start()
         return callback
 
+    def _make_edit_toggle_callback(self, provider_key):
+        def callback(_):
+            if self._auth[provider_key]["token"]:
+                self._deauth_edit_provider(provider_key)
+            else:
+                threading.Thread(
+                    target=self._do_auth_edit, args=(provider_key,), daemon=True
+                ).start()
+        return callback
+
     # ── MSAL (Microsoft) ─────────────────────────────────────────────────────
 
     def _rebuild_msal_app(self):
@@ -377,6 +627,50 @@ class VoittaAuthApp(rumps.App):
             )
         else:
             self._auth["microsoft"]["msal_app"] = None
+
+    def _rebuild_msal_app_edit(self):
+        tenant_id = self._settings.get("ms_edit_tenant_id", "") or self._settings.get("ms_tenant_id", "")
+        client_id = self._settings.get("ms_edit_client_id", "") or self._settings.get("ms_client_id", "")
+        if tenant_id and client_id:
+            self._auth["microsoft_edit"]["msal_app"] = msal.PublicClientApplication(
+                client_id,
+                authority=f"https://login.microsoftonline.com/{tenant_id}",
+            )
+        else:
+            self._auth["microsoft_edit"]["msal_app"] = None
+
+    # ── Edit MCP .env sync ────────────────────────────────────────────────────
+
+    def _sync_edit_mcp_env(self):
+        """Write Google Edit credentials to the workspace MCP server's .env file."""
+        env_path = self.edit_mcp_env_path
+        if not env_path:
+            return
+
+        client_id = (self._settings.get("google_edit_client_id", "")
+                     or self._settings.get("google_client_id", ""))
+        client_secret = (self._settings.get("google_edit_client_secret", "")
+                         or self._settings.get("google_client_secret", ""))
+
+        if not client_id or not client_secret:
+            print("[voitta-auth] Skipping edit MCP .env sync — no Google credentials")
+            return
+
+        lines = [
+            "# Managed by voitta-auth — do not edit manually",
+            f"GOOGLE_OAUTH_CLIENT_ID={client_id}",
+            f"GOOGLE_OAUTH_CLIENT_SECRET={client_secret}",
+            "MCP_ENABLE_OAUTH21=true",
+            "EXTERNAL_OAUTH21_PROVIDER=true",
+            "",
+        ]
+        try:
+            Path(env_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(env_path, "w") as f:
+                f.write("\n".join(lines))
+            print(f"[voitta-auth] Wrote edit MCP .env → {env_path}")
+        except Exception as e:
+            print(f"[voitta-auth] Failed to write edit MCP .env: {e}")
 
     # ── Auth dispatcher ──────────────────────────────────────────────────────
 
@@ -605,6 +899,152 @@ class VoittaAuthApp(rumps.App):
         except Exception:
             state["profile"] = None
 
+    # ── Edit auth dispatcher ────────────────────────────────────────────────
+
+    def _do_auth_edit(self, provider_key):
+        if not self._auth_lock.acquire(blocking=False):
+            _notify("Voitta Auth", "Busy", "Another authentication is in progress.")
+            return
+        try:
+            label = EDIT_PROVIDERS[provider_key]["label"]
+            print(f"[voitta-auth] Starting {label} OAuth2 flow...")
+            if provider_key == "microsoft_edit":
+                self._do_auth_microsoft_edit()
+            elif provider_key == "google_edit":
+                self._do_auth_google_edit()
+        except Exception as e:
+            print(f"[voitta-auth] {provider_key} EXCEPTION: {e}")
+            traceback.print_exc()
+            _notify("Voitta Auth", "Error", str(e))
+        finally:
+            self._auth_lock.release()
+
+    # ── Microsoft Edit auth ─────────────────────────────────────────────────
+
+    def _do_auth_microsoft_edit(self):
+        state = self._auth["microsoft_edit"]
+        msal_app = state["msal_app"]
+        if not msal_app:
+            _notify("Voitta Auth", "Microsoft Edit", "Configure Tenant ID and Client ID in Settings first.")
+            return
+
+        scopes = EDIT_PROVIDERS["microsoft_edit"]["scopes"]
+        auth_url = msal_app.get_authorization_request_url(
+            scopes, redirect_uri=REDIRECT_URI
+        )
+        webbrowser.open(auth_url)
+        code, error = self._wait_for_callback()
+
+        if not code:
+            _notify("Voitta Auth", "Microsoft Edit", error or "No authorization code received.")
+            return
+
+        print("[voitta-auth] Got Microsoft Edit auth code, exchanging for token...")
+        result = msal_app.acquire_token_by_authorization_code(
+            code, scopes=scopes, redirect_uri=REDIRECT_URI
+        )
+
+        if "access_token" in result:
+            state["token"] = result["access_token"]
+            self._fetch_profile_microsoft_edit()
+            self._schedule_refresh("microsoft_edit", result.get("expires_in", 3600))
+            name = state["profile"].get("name", "Unknown") if state["profile"] else "Unknown"
+            print(f"[voitta-auth] Microsoft Edit authenticated as {name}")
+            self._update_menu_state()
+            _notify("Voitta Auth", "Microsoft Edit", f"Welcome, {name}!")
+        else:
+            error = result.get("error_description", result.get("error", "Unknown error"))
+            print(f"[voitta-auth] Microsoft Edit token exchange failed: {error}")
+            _notify("Voitta Auth", "Microsoft Edit", str(error))
+
+    def _fetch_profile_microsoft_edit(self):
+        state = self._auth["microsoft_edit"]
+        try:
+            resp = requests.get(
+                "https://graph.microsoft.com/v1.0/me",
+                headers={"Authorization": f"Bearer {state['token']}"},
+                timeout=10,
+            )
+            if resp.ok:
+                data = resp.json()
+                state["profile"] = {
+                    "email": data.get("mail") or data.get("userPrincipalName", ""),
+                    "name": data.get("displayName", ""),
+                }
+        except Exception:
+            state["profile"] = None
+
+    # ── Google Edit auth ────────────────────────────────────────────────────
+
+    def _do_auth_google_edit(self):
+        client_id = self._settings.get("google_edit_client_id", "") or self._settings.get("google_client_id", "")
+        client_secret = self._settings.get("google_edit_client_secret", "") or self._settings.get("google_client_secret", "")
+        if not client_id or not client_secret:
+            _notify("Voitta Auth", "Google Edit", "Configure Client ID and Client Secret in Settings first.")
+            return
+
+        verifier, challenge = _pkce_pair()
+        params = {
+            "client_id": client_id,
+            "redirect_uri": REDIRECT_URI,
+            "response_type": "code",
+            "scope": EDIT_PROVIDERS["google_edit"]["scopes"],
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "access_type": "offline",
+            "prompt": "consent",
+        }
+        auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+        webbrowser.open(auth_url)
+        code, error = self._wait_for_callback()
+
+        if not code:
+            _notify("Voitta Auth", "Google Edit", error or "No authorization code received.")
+            return
+
+        print("[voitta-auth] Got Google Edit auth code, exchanging for token...")
+        resp = requests.post("https://oauth2.googleapis.com/token", data={
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": REDIRECT_URI,
+        }, timeout=10)
+
+        if not resp.ok:
+            _notify("Voitta Auth", "Google Edit", f"Token exchange failed: {resp.text[:200]}")
+            return
+
+        data = resp.json()
+        state = self._auth["google_edit"]
+        state["token"] = data["access_token"]
+        state["refresh_token"] = data.get("refresh_token")
+        self._fetch_profile_google_edit()
+        self._schedule_refresh("google_edit", data.get("expires_in", 3600))
+        name = state["profile"].get("name", "Unknown") if state["profile"] else "Unknown"
+        print(f"[voitta-auth] Google Edit authenticated as {name}")
+        self._update_menu_state()
+        self._sync_edit_mcp_env()
+        _notify("Voitta Auth", "Google Edit", f"Welcome, {name}!")
+
+    def _fetch_profile_google_edit(self):
+        state = self._auth["google_edit"]
+        try:
+            resp = requests.get(
+                "https://www.googleapis.com/oauth2/v3/userinfo",
+                headers={"Authorization": f"Bearer {state['token']}"},
+                timeout=10,
+            )
+            if resp.ok:
+                data = resp.json()
+                state["profile"] = {
+                    "email": data.get("email", ""),
+                    "name": data.get("name", ""),
+                }
+        except Exception:
+            state["profile"] = None
+
     # ── Token refresh ────────────────────────────────────────────────────────
 
     def _schedule_refresh(self, provider_key, expires_in):
@@ -615,13 +1055,17 @@ class VoittaAuthApp(rumps.App):
 
         if provider_key == "microsoft":
             timer = threading.Timer(refresh_in, self._do_refresh_microsoft)
-        elif provider_key == "google":
+        elif provider_key == "microsoft_edit":
+            timer = threading.Timer(refresh_in, self._do_refresh_microsoft_edit)
+        elif provider_key in ("google", "google_edit"):
             timer = threading.Timer(refresh_in, self._do_refresh_generic,
-                                    args=("google", "https://oauth2.googleapis.com/token"))
+                                    args=(provider_key, "https://oauth2.googleapis.com/token"))
         elif provider_key == "okta":
             domain = self._settings.get("okta_domain", "")
             timer = threading.Timer(refresh_in, self._do_refresh_generic,
                                     args=("okta", f"https://{domain}/oauth2/default/v1/token"))
+        else:
+            return
 
         timer.daemon = True
         timer.start()
@@ -647,6 +1091,26 @@ class VoittaAuthApp(rumps.App):
             state["profile"] = None
             self._update_menu_state()
 
+    def _do_refresh_microsoft_edit(self):
+        state = self._auth["microsoft_edit"]
+        msal_app = state["msal_app"]
+        if not msal_app:
+            return
+        accounts = msal_app.get_accounts()
+        if not accounts:
+            return
+        scopes = EDIT_PROVIDERS["microsoft_edit"]["scopes"]
+        result = msal_app.acquire_token_silent(scopes, account=accounts[0], force_refresh=True)
+        if result and "access_token" in result:
+            state["token"] = result["access_token"]
+            self._schedule_refresh("microsoft_edit", result.get("expires_in", 3600))
+            print("[voitta-auth] Microsoft Edit token refreshed silently")
+        else:
+            print("[voitta-auth] Microsoft Edit silent refresh failed — user must re-authenticate")
+            state["token"] = None
+            state["profile"] = None
+            self._update_menu_state()
+
     def _do_refresh_generic(self, provider_key, token_endpoint):
         state = self._auth[provider_key]
         if not state["refresh_token"]:
@@ -656,6 +1120,9 @@ class VoittaAuthApp(rumps.App):
         if provider_key == "google":
             client_id = self._settings.get("google_client_id", "")
             client_secret = self._settings.get("google_client_secret", "")
+        elif provider_key == "google_edit":
+            client_id = self._settings.get("google_edit_client_id", "") or self._settings.get("google_client_id", "")
+            client_secret = self._settings.get("google_edit_client_secret", "") or self._settings.get("google_client_secret", "")
         elif provider_key == "okta":
             client_id = self._settings.get("okta_client_id", "")
             client_secret = None
@@ -713,11 +1180,35 @@ class VoittaAuthApp(rumps.App):
         _notify("Voitta Auth", label, "Signed out.")
         self._update_menu_state()
 
+    def _deauth_edit_provider(self, provider_key):
+        state = self._auth[provider_key]
+        if state["refresh_timer"]:
+            state["refresh_timer"].cancel()
+            state["refresh_timer"] = None
+
+        if provider_key == "microsoft_edit" and state["msal_app"]:
+            for account in state["msal_app"].get_accounts():
+                state["msal_app"].remove_account(account)
+
+        state["token"] = None
+        state["refresh_token"] = None
+        state["profile"] = None
+
+        label = EDIT_PROVIDERS[provider_key]["label"]
+        print(f"[voitta-auth] {label} signed out")
+        _notify("Voitta Auth", label, "Signed out.")
+        self._update_menu_state()
+
     # ── Proxy ────────────────────────────────────────────────────────────────
 
     def _run_proxy(self):
         server = ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
         print(f"[voitta-auth] Proxy listening on http://127.0.0.1:{PROXY_PORT} → {self.voitta_rag_url}")
+        server.serve_forever()
+
+    def _run_edit_proxy(self):
+        server = ThreadingHTTPServer(("127.0.0.1", EDIT_PROXY_PORT), EditProxyHandler)
+        print(f"[voitta-auth] Edit proxy listening on http://127.0.0.1:{EDIT_PROXY_PORT} → {self.edit_proxy_url}")
         server.serve_forever()
 
     # ── Settings ─────────────────────────────────────────────────────────────
@@ -732,8 +1223,15 @@ class VoittaAuthApp(rumps.App):
         return {}
 
     def _save_settings(self):
-        data = {"voitta_rag_url": self.voitta_rag_url}
+        data = {
+            "voitta_rag_url": self.voitta_rag_url,
+            "edit_proxy_url": self.edit_proxy_url,
+            "edit_mcp_env_path": self.edit_mcp_env_path,
+        }
         for cfg in PROVIDERS.values():
+            for settings_key, _ in cfg["settings_fields"]:
+                data[settings_key] = self._settings.get(settings_key, "")
+        for cfg in EDIT_PROVIDERS.values():
             for settings_key, _ in cfg["settings_fields"]:
                 data[settings_key] = self._settings.get(settings_key, "")
         with open(SETTINGS_PATH, "w") as f:
@@ -747,7 +1245,7 @@ class VoittaAuthApp(rumps.App):
         )
         from Foundation import NSMakeRect
 
-        label_w, field_w, row_h, header_h, gap = 120, 310, 22, 20, 8
+        label_w, field_w, row_h, header_h, gap = 140, 512, 22, 20, 8
         total_w = label_w + field_w
 
         # Build row descriptors: (label, value_or_None, settings_key_or_None, is_header)
@@ -757,6 +1255,18 @@ class VoittaAuthApp(rumps.App):
             rows.append((f"── {cfg['label']} ──", None, None, True))
             for settings_key, field_label in cfg["settings_fields"]:
                 rows.append((field_label, self._settings.get(settings_key, ""), settings_key, False))
+
+        rows.append(("Edit Proxy URL:", self.edit_proxy_url, "edit_proxy_url", False))
+        rows.append(("Edit MCP .env:", self.edit_mcp_env_path, "edit_mcp_env_path", False))
+        for key in EDIT_PROVIDER_ORDER:
+            cfg = EDIT_PROVIDERS[key]
+            rows.append((f"── {cfg['label']} ──", None, None, True))
+            for settings_key, field_label in cfg["settings_fields"]:
+                val = self._settings.get(settings_key, "")
+                if not val:
+                    base_key = cfg["settings_defaults_from"].get(settings_key, "")
+                    val = self._settings.get(base_key, "")
+                rows.append((field_label, val, settings_key, False))
 
         # Calculate total height
         total_h = 0
@@ -822,13 +1332,17 @@ class VoittaAuthApp(rumps.App):
 
         # Collect new values
         old_settings = dict(self._settings)
-        self.voitta_rag_url = text_fields[0][1].stringValue().strip().rstrip("/") or self.voitta_rag_url
 
         for settings_key, fld in text_fields:
             val = fld.stringValue().strip()
             if settings_key == "voitta_rag_url":
-                continue  # already handled
-            self._settings[settings_key] = val
+                self.voitta_rag_url = val.rstrip("/") or self.voitta_rag_url
+            elif settings_key == "edit_proxy_url":
+                self.edit_proxy_url = val.rstrip("/") or self.edit_proxy_url
+            elif settings_key == "edit_mcp_env_path":
+                self.edit_mcp_env_path = val or self.edit_mcp_env_path
+            else:
+                self._settings[settings_key] = val
 
         self._save_settings()
 
@@ -845,6 +1359,20 @@ class VoittaAuthApp(rumps.App):
                     self._rebuild_msal_app()
                 print(f"[voitta-auth] {PROVIDERS[key]['label']} credentials changed — session cleared")
 
+        for key, cfg in EDIT_PROVIDERS.items():
+            changed = False
+            for settings_key, _ in cfg["settings_fields"]:
+                if self._settings.get(settings_key, "") != old_settings.get(settings_key, ""):
+                    changed = True
+                    break
+            if changed:
+                self._deauth_edit_provider(key)
+                if key == "microsoft_edit":
+                    self._rebuild_msal_app_edit()
+                print(f"[voitta-auth] {cfg['label']} credentials changed — session cleared")
+
+        self._sync_edit_mcp_env()
+
     # ── Help ─────────────────────────────────────────────────────────────────
 
     def show_help(self, _):
@@ -853,11 +1381,12 @@ class VoittaAuthApp(rumps.App):
         alert.setMessageText_("Voitta Auth Help")
         alert.setInformativeText_(
             "Voitta Auth sits in your menu bar.\n\n"
-            "Status: M G O\n"
-            "  Bright = authenticated, dimmed = not authenticated\n\n"
-            "Activate/Deactivate each provider independently.\n"
-            "All authenticated providers inject headers into the proxy.\n\n"
-            f"Proxy: http://127.0.0.1:{PROXY_PORT} → {self.voitta_rag_url}"
+            "Status: M G O  (M) (G)\n"
+            "  Bright = authenticated, dimmed = not authenticated\n"
+            "  Letters = RAG providers, circled = Edit providers\n\n"
+            "Activate/Deactivate each provider independently.\n\n"
+            f"RAG proxy: http://127.0.0.1:{PROXY_PORT} → {self.voitta_rag_url}\n"
+            f"Edit proxy: http://127.0.0.1:{EDIT_PROXY_PORT} → {self.edit_proxy_url}"
         )
         alert.addButtonWithTitle_("OK")
         _show_modal(alert)
