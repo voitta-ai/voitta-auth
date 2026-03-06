@@ -1,17 +1,19 @@
 # Voitta Auth
 
-A macOS menu bar application that authenticates users via multiple identity providers (Microsoft, Google, Okta) and runs local HTTP proxies that inject auth headers into requests to MCP servers. Designed for use with [Claude Code](https://claude.com/claude-code).
+A macOS menu bar application that authenticates users via multiple identity providers (Microsoft, Google, Okta) and runs local HTTP proxies that inject auth headers into requests to MCP servers. Also proxies the Atlassian-hosted Jira MCP server with Basic Auth injection. Designed for use with [Claude Code](https://claude.com/claude-code).
 
 ## How It Works
 
-1. Sits in the macOS menu bar showing `M G O` (RAG providers) and circled `(M) (G)` (Edit providers). Bright when authenticated, dimmed when not. Adapts to the system light/dark theme
+1. Sits in the macOS menu bar showing `M G O J` (RAG providers + Jira) and circled `(M) (G)` (Edit providers). Bright when authenticated/configured, dimmed when not. Adapts to the system light/dark theme
 2. Each provider can be activated/deactivated independently
 3. On activation, opens the provider's login page in the browser and captures the OAuth2 callback
 4. Runs two local HTTP proxies:
    - **RAG proxy** (default `http://127.0.0.1:18765`) — forwards to [voitta-rag](https://github.com/voitta-ai/voitta-rag), injects per-provider `X-Auth-Token-*` headers
    - **Edit proxy** (default `http://127.0.0.1:18766`) — forwards to a workspace MCP server, injects standard `Authorization: Bearer` header
+   - **Jira proxy** (default `http://127.0.0.1:18767`) — forwards to the Atlassian-hosted Jira MCP server, injects `Authorization: Basic` header
 5. Edit providers use broader OAuth scopes for document editing (Sheets, Docs, Slides, Drive for Google; Files, Sites for Microsoft)
-6. Tokens are held in memory and refreshed automatically while the app is running
+6. Jira uses static credentials (email + API token) — no browser login or token refresh needed
+7. OAuth tokens are held in memory and refreshed automatically while the app is running
 
 ## Prerequisites
 
@@ -78,6 +80,14 @@ Default credentials for the shared `voitta-auth` GCP project are embedded in `.e
 
 > The app uses the default authorization server (`/oauth2/default`). No client secret is needed — Okta native apps use PKCE.
 
+### Jira (Atlassian)
+
+1. Go to [Atlassian Account Settings](https://id.atlassian.com/manage-profile/security/api-tokens) > **Create API token**
+2. Copy the token → `JIRA_API_TOKEN`
+3. Use the email address of your Atlassian account → `JIRA_EMAIL`
+
+> No OAuth flow — voitta-auth stores the email and API token and injects them as `Authorization: Basic base64(email:token)` into every request to the Atlassian MCP server. The `J` indicator in the menu bar is bright when both fields are configured.
+
 ## Quick Start
 
 ```bash
@@ -116,6 +126,9 @@ Initial values come from `.env` (see `.env.sample`). After first launch, use the
 | `EDIT_PROXY_PORT` | Edit | Local port for the edit proxy (default: `18766`) |
 | `EDIT_PROXY_URL` | Edit | Upstream workspace MCP URL (default: `http://localhost:8000`) |
 | `EDIT_MCP_ENV_PATH` | Edit | Path to the workspace MCP server's `.env` file (default: `~/DEVEL/google_workspace_mcp/.env`) |
+| `JIRA_EMAIL` | Jira | Atlassian account email |
+| `JIRA_API_TOKEN` | Jira | Atlassian API token |
+| `JIRA_PROXY_PORT` | Jira | Local port for the Jira proxy (default: `18767`) |
 
 Edit provider credentials default to the same values as the corresponding RAG provider. Override them in Settings to use separate OAuth apps.
 
@@ -147,6 +160,14 @@ The Edit proxy (port 18766) injects a single standard `Authorization` header fro
 
 This is designed for use with [google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp) in `EXTERNAL_OAUTH21_PROVIDER=true` mode, or any MCP server that accepts standard Bearer tokens.
 
+### Jira Proxy Headers
+
+The Jira proxy (port 18767) injects the stored credentials as a Basic Auth header and forwards all requests to the Atlassian-hosted MCP server at `https://mcp.atlassian.com/v1/mcp`:
+
+| Header | Description |
+|--------|-------------|
+| `Authorization` | `Basic base64(email:token)` from Jira credentials in Settings |
+
 ### Automatic MCP Server Configuration
 
 When `EDIT_MCP_ENV_PATH` is set (default: `~/DEVEL/google_workspace_mcp/.env`), voitta-auth automatically writes the Google Edit OAuth credentials to the workspace MCP server's `.env` file. This means the MCP server requires zero manual credential configuration — just clone it and run:
@@ -162,7 +183,7 @@ voitta-auth writes `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `MCP_
 
 ### Claude Code MCP Setup
 
-Point your MCP server configs at the local proxies:
+Add the following to your `claude_desktop_config.json` or `.claude/settings.json` (or project-level `.mcp.json`):
 
 ```json
 {
@@ -172,10 +193,15 @@ Point your MCP server configs at the local proxies:
     },
     "google-workspace": {
       "url": "http://127.0.0.1:18766/mcp"
+    },
+    "jira": {
+      "url": "http://127.0.0.1:18767/mcp"
     }
   }
 }
 ```
+
+The Jira MCP server (hosted by Atlassian at `mcp.atlassian.com`) supports read and write operations — creating, updating, searching, and bulk-creating Jira issues. Voitta-auth proxies the connection and handles authentication, so clients don't need to know the API token.
 
 ## License
 

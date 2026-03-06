@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Voitta Auth - macOS menu bar app for multi-provider OAuth2 authentication with MCP proxy."""
 
+import atexit
 import base64
 import hashlib
 import json
 import os
+import re
 import secrets
+import subprocess
 import threading
 import traceback
 import webbrowser
@@ -67,6 +70,21 @@ PROVIDERS = {
 PROVIDER_ORDER = ("microsoft", "google", "okta")
 PROVIDER_LETTERS = {"microsoft": "M", "google": "G", "okta": "O"}
 
+# ── Jira (credential-based, non-OAuth) ──────────────────────────────────────
+
+JIRA_SETTINGS_FIELDS = [
+    ("jira_url", "Jira URL:"),
+    ("jira_email", "Email:"),
+    ("jira_api_token", "API Token:"),
+    ("jira_project", "Project:"),
+]
+JIRA_ENV_DEFAULTS = {
+    "jira_url": "JIRA_URL",
+    "jira_email": "JIRA_EMAIL",
+    "jira_api_token": "JIRA_API_TOKEN",
+    "jira_project": "JIRA_PROJECT",
+}
+
 # ── Edit provider registry ──────────────────────────────────────────────────
 
 EDIT_PROVIDERS = {
@@ -120,10 +138,108 @@ REDIRECT_PORT = int(os.environ.get("REDIRECT_PORT", "53214"))
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "18765"))
 EDIT_PROXY_PORT = int(os.environ.get("EDIT_PROXY_PORT", "18766"))
+JIRA_MCP_PORT = int(os.environ.get("JIRA_MCP_PORT", "18767"))
 VOITTA_RAG_URL = os.environ.get("VOITTA_RAG_URL", "https://rag.voitta.ai")
 EDIT_PROXY_URL = os.environ.get("EDIT_PROXY_URL", "http://localhost:8000")
 EDIT_MCP_ENV_PATH = os.environ.get("EDIT_MCP_ENV_PATH", os.path.expanduser("~/DEVEL/google_workspace_mcp/.env"))
+JIRA_MCP_ENV_PATH = os.environ.get("JIRA_MCP_ENV_PATH", os.path.expanduser("~/DEVEL/mcp-atlassian/.env"))
+GOOGLE_MCP_DIR = os.environ.get("GOOGLE_MCP_DIR", os.path.expanduser("~/DEVEL/google_workspace_mcp"))
+JIRA_MCP_DIR = os.environ.get("JIRA_MCP_DIR", os.path.expanduser("~/DEVEL/mcp-atlassian"))
 SETTINGS_PATH = Path.home() / ".voitta_auth_settings.json"
+
+
+# ── Jira URL helpers ─────────────────────────────────────────────────────────
+
+def _parse_jira_url(url):
+    """Parse a Jira URL into (base_url, project_key).
+
+    Supports:
+      https://org.atlassian.net/jira/software/projects/PROJ/issues/...
+      https://jira.example.com/browse/PROJ
+      https://jira.example.com/browse/PROJ-123
+      https://jira.example.com/projects/PROJ
+      Also extracts project from JQL query param.
+    """
+    parsed = urlparse(url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    path_parts = [p for p in (parsed.path or "").strip("/").split("/") if p]
+
+    project_key = ""
+    for i, part in enumerate(path_parts):
+        if part in ("projects", "browse") and i + 1 < len(path_parts):
+            key_part = path_parts[i + 1]
+            project_key = key_part.split("-")[0].upper()
+            break
+
+    # Fallback: try project key from JQL in query params
+    if not project_key:
+        qs = parse_qs(parsed.query)
+        jql = qs.get("jql", [""])[0]
+        if jql:
+            m = re.search(r'project\s*=\s*["\']?(\w+)', jql)
+            if m:
+                project_key = m.group(1).upper()
+
+    return base_url, project_key
+
+
+def _fetch_jira_projects(base_url, email, token):
+    """Fetch available Jira Cloud projects. Returns list of (key, name) tuples."""
+    cred = base64.b64encode(f"{email}:{token}".encode()).decode()
+    headers = {"Authorization": f"Basic {cred}", "Content-Type": "application/json"}
+    projects = []
+    start_at = 0
+    while True:
+        try:
+            resp = requests.get(
+                f"{base_url}/rest/api/3/project/search",
+                params={"startAt": start_at, "maxResults": 50},
+                headers=headers,
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                print(f"[jira] Failed to fetch projects: {resp.status_code} {resp.text[:200]}")
+                break
+            data = resp.json()
+            for p in data.get("values", []):
+                projects.append((p["key"], p.get("name", p["key"])))
+            if data.get("isLast", True):
+                break
+            start_at += len(data.get("values", []))
+        except Exception as e:
+            print(f"[jira] Error fetching projects: {e}")
+            break
+    projects.sort()
+    return projects
+
+
+class _JiraFetchHelper(NSObject):
+    """Button action handler for fetching Jira projects inside the settings dialog."""
+
+    def doFetch_(self, sender):
+        url = self._url_field.stringValue().strip()
+        email = self._email_field.stringValue().strip()
+        token = self._token_field.stringValue().strip()
+        if not (url and email and token):
+            self._popup.removeAllItems()
+            self._popup.addItemWithTitle_("(enter URL, email, and token first)")
+            return
+
+        server_url, parsed_project = _parse_jira_url(url)
+        default_proj = self._default_project or parsed_project
+        projects = _fetch_jira_projects(server_url, email, token)
+
+        self._popup.removeAllItems()
+        if not projects:
+            self._popup.addItemWithTitle_("(no projects found — check credentials)")
+        else:
+            selected_idx = 0
+            for i, (key, name) in enumerate(projects):
+                self._popup.addItemWithTitle_(f"{key} — {name}")
+                if key == default_proj:
+                    selected_idx = i
+            self._popup.selectItemAtIndex_(selected_idx)
+
 
 # Hop-by-hop headers that must not be forwarded
 HOP_BY_HOP = frozenset([
@@ -420,7 +536,7 @@ class EditProxyHandler(BaseHTTPRequestHandler):
 
 class VoittaAuthApp(rumps.App):
     def __init__(self):
-        super().__init__("Voitta", title="M G O")
+        super().__init__("Voitta", title="M G O J")
 
         self._auth_lock = threading.Lock()
         self._auth = {}
@@ -449,6 +565,7 @@ class VoittaAuthApp(rumps.App):
         self.voitta_rag_url = self._settings.get("voitta_rag_url", VOITTA_RAG_URL)
         self.edit_proxy_url = self._settings.get("edit_proxy_url", EDIT_PROXY_URL)
         self.edit_mcp_env_path = self._settings.get("edit_mcp_env_path", EDIT_MCP_ENV_PATH)
+        self.jira_mcp_env_path = self._settings.get("jira_mcp_env_path", JIRA_MCP_ENV_PATH)
 
         # Load per-provider credentials from settings (fall back to env vars)
         for key, cfg in PROVIDERS.items():
@@ -464,12 +581,23 @@ class VoittaAuthApp(rumps.App):
                     base_key = cfg["settings_defaults_from"].get(settings_key, "")
                     self._settings[settings_key] = env_val or self._settings.get(base_key, "")
 
+        # Load Jira credentials (fall back to env vars)
+        for settings_key, env_var in JIRA_ENV_DEFAULTS.items():
+            if settings_key not in self._settings:
+                self._settings[settings_key] = os.environ.get(env_var, "")
+
         # Initialize MSAL for Microsoft (read + edit)
         self._rebuild_msal_app()
         self._rebuild_msal_app_edit()
 
         # Sync Google Edit credentials to the workspace MCP server's .env
         self._sync_edit_mcp_env()
+
+        # Sync Jira credentials to the mcp-atlassian server's .env
+        self._sync_jira_mcp_env()
+
+        # Launch MCP server subprocesses (after .env sync)
+        self._start_mcp_subprocesses()
 
         # Build menu with direct references
         self._menu_items = {}
@@ -486,6 +614,10 @@ class VoittaAuthApp(rumps.App):
             self._menu_items[key] = item
             menu_list.append(item)
         menu_list.append(None)  # separator
+        jira_item = rumps.MenuItem("Jira: Not Configured", callback=self.show_settings)
+        self._menu_items["jira"] = jira_item
+        menu_list.append(jira_item)
+        menu_list.append(None)  # separator
         menu_list.append(rumps.MenuItem("Settings", callback=self.show_settings))
         menu_list.append(rumps.MenuItem("Help", callback=self.show_help))
         self.menu = menu_list
@@ -499,7 +631,9 @@ class VoittaAuthApp(rumps.App):
     # ── Menu state ───────────────────────────────────────────────────────────
 
     def _build_title(self):
-        return " ".join(PROVIDER_LETTERS[k] for k in PROVIDER_ORDER)
+        parts = [PROVIDER_LETTERS[k] for k in PROVIDER_ORDER]
+        parts.append("J")
+        return " ".join(parts)
 
     def _apply_attributed_title(self):
         """Set menu bar title with dimmed/bright letters + circled edit indicators."""
@@ -530,6 +664,21 @@ class VoittaAuthApp(rumps.App):
                 PROVIDER_LETTERS[key], attrs
             )
             title.appendAttributedString_(char)
+
+        # Jira letter (J) — bright if credentials configured, dim otherwise
+        space = NSAttributedString.alloc().initWithString_attributes_(
+            " ", {NSFontAttributeName: font}
+        )
+        title.appendAttributedString_(space)
+        jira_active = self._has_jira_credentials()
+        alpha = 1.0 if jira_active else 0.4
+        color = NSColor.colorWithCalibratedWhite_alpha_(base, alpha)
+        attrs = {
+            NSForegroundColorAttributeName: color,
+            NSFontAttributeName: font,
+        }
+        j_char = NSAttributedString.alloc().initWithString_attributes_("J", attrs)
+        title.appendAttributedString_(j_char)
 
         # Edit provider circled letters
         any_edit = any(self._has_edit_credentials(k) for k in EDIT_PROVIDER_ORDER)
@@ -577,6 +726,29 @@ class VoittaAuthApp(rumps.App):
                     return False
         return True
 
+    def _has_jira_credentials(self):
+        """Return True if Jira is fully configured (URL, email, token, and project)."""
+        return (
+            bool(self._settings.get("jira_url", ""))
+            and bool(self._settings.get("jira_email", ""))
+            and bool(self._settings.get("jira_api_token", ""))
+            and bool(self._settings.get("jira_project", ""))
+        )
+
+    def _log_jira_projects(self):
+        """Fetch and log available Jira projects in the background."""
+        server_url = self._settings.get("jira_server_url", "")
+        email = self._settings.get("jira_email", "")
+        token = self._settings.get("jira_api_token", "")
+        if not (server_url and email and token):
+            return
+        projects = _fetch_jira_projects(server_url, email, token)
+        if projects:
+            names = ", ".join(f"{k} ({n})" for k, n in projects)
+            print(f"[jira] Available projects: {names}")
+        else:
+            print("[jira] No projects found or failed to fetch")
+
     def _update_menu_state(self):
         self.title = self._build_title()
         self._apply_attributed_title()
@@ -594,6 +766,17 @@ class VoittaAuthApp(rumps.App):
                 item.title = f"Deactivate {label}"
             else:
                 item.title = f"Activate {label}"
+        # Jira status
+        if "jira" in self._menu_items:
+            if self._has_jira_credentials():
+                email = self._settings.get("jira_email", "")
+                project = self._settings.get("jira_project", "")
+                if project:
+                    self._menu_items["jira"].title = f"Jira: {project} ({email})"
+                else:
+                    self._menu_items["jira"].title = f"Jira: {email}"
+            else:
+                self._menu_items["jira"].title = "Jira: Not Configured"
 
     def _make_toggle_callback(self, provider_key):
         def callback(_):
@@ -671,6 +854,47 @@ class VoittaAuthApp(rumps.App):
             print(f"[voitta-auth] Wrote edit MCP .env → {env_path}")
         except Exception as e:
             print(f"[voitta-auth] Failed to write edit MCP .env: {e}")
+
+    # ── Jira MCP .env sync ───────────────────────────────────────────────────
+
+    def _sync_jira_mcp_env(self):
+        """Write Jira credentials to the mcp-atlassian server's .env file."""
+        env_path = self.jira_mcp_env_path
+        if not env_path:
+            return
+
+        jira_url = self._settings.get("jira_server_url", "")
+        if not jira_url:
+            # Try parsing from jira_url setting
+            raw_url = self._settings.get("jira_url", "")
+            if raw_url:
+                jira_url, _ = _parse_jira_url(raw_url)
+        email = self._settings.get("jira_email", "")
+        token = self._settings.get("jira_api_token", "")
+
+        if not jira_url or not email or not token:
+            print("[voitta-auth] Skipping Jira MCP .env sync — missing credentials")
+            return
+
+        project = self._settings.get("jira_project", "")
+
+        lines = [
+            "# Managed by voitta-auth — do not edit manually",
+            f"JIRA_URL={jira_url}",
+            f"JIRA_USERNAME={email}",
+            f"JIRA_API_TOKEN={token}",
+        ]
+        if project:
+            lines.append(f"JIRA_PROJECTS_FILTER={project}")
+        lines.append("")
+
+        try:
+            Path(env_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(env_path, "w") as f:
+                f.write("\n".join(lines))
+            print(f"[voitta-auth] Wrote Jira MCP .env → {env_path}")
+        except Exception as e:
+            print(f"[voitta-auth] Failed to write Jira MCP .env: {e}")
 
     # ── Auth dispatcher ──────────────────────────────────────────────────────
 
@@ -1211,6 +1435,63 @@ class VoittaAuthApp(rumps.App):
         print(f"[voitta-auth] Edit proxy listening on http://127.0.0.1:{EDIT_PROXY_PORT} → {self.edit_proxy_url}")
         server.serve_forever()
 
+    # ── MCP subprocess management ────────────────────────────────────────────
+
+    def _start_mcp_subprocesses(self):
+        """Launch google_workspace_mcp and mcp-atlassian as background processes."""
+        self._subprocesses = []
+
+        # Google Workspace MCP
+        if Path(GOOGLE_MCP_DIR).is_dir():
+            try:
+                proc = subprocess.Popen(
+                    ["uv", "run", "main.py", "--transport", "streamable-http"],
+                    cwd=GOOGLE_MCP_DIR,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._subprocesses.append(proc)
+                print(f"[voitta-auth] Started google_workspace_mcp (pid {proc.pid}) in {GOOGLE_MCP_DIR}")
+            except Exception as e:
+                print(f"[voitta-auth] Failed to start google_workspace_mcp: {e}")
+        else:
+            print(f"[voitta-auth] Skipping google_workspace_mcp — {GOOGLE_MCP_DIR} not found")
+
+        # mcp-atlassian (Jira/Confluence)
+        env_file = self.jira_mcp_env_path
+        if Path(JIRA_MCP_DIR).is_dir() and env_file and Path(env_file).exists():
+            try:
+                proc = subprocess.Popen(
+                    [
+                        "uvx", "mcp-atlassian",
+                        "--transport", "streamable-http",
+                        "--port", str(JIRA_MCP_PORT),
+                        "--env-file", env_file,
+                    ],
+                    cwd=JIRA_MCP_DIR,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._subprocesses.append(proc)
+                print(f"[voitta-auth] Started mcp-atlassian (pid {proc.pid}) on port {JIRA_MCP_PORT}")
+            except Exception as e:
+                print(f"[voitta-auth] Failed to start mcp-atlassian: {e}")
+        else:
+            print(f"[voitta-auth] Skipping mcp-atlassian — {JIRA_MCP_DIR} or {env_file} not found")
+
+        atexit.register(self._stop_mcp_subprocesses)
+
+    def _stop_mcp_subprocesses(self):
+        """Terminate all managed MCP subprocesses."""
+        for proc in getattr(self, "_subprocesses", []):
+            if proc.poll() is None:
+                print(f"[voitta-auth] Terminating subprocess pid {proc.pid}")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
     # ── Settings ─────────────────────────────────────────────────────────────
 
     def _load_settings(self):
@@ -1227,6 +1508,7 @@ class VoittaAuthApp(rumps.App):
             "voitta_rag_url": self.voitta_rag_url,
             "edit_proxy_url": self.edit_proxy_url,
             "edit_mcp_env_path": self.edit_mcp_env_path,
+            "jira_mcp_env_path": self.jira_mcp_env_path,
         }
         for cfg in PROVIDERS.values():
             for settings_key, _ in cfg["settings_fields"]:
@@ -1234,14 +1516,19 @@ class VoittaAuthApp(rumps.App):
         for cfg in EDIT_PROVIDERS.values():
             for settings_key, _ in cfg["settings_fields"]:
                 data[settings_key] = self._settings.get(settings_key, "")
+        for settings_key, _ in JIRA_SETTINGS_FIELDS:
+            data[settings_key] = self._settings.get(settings_key, "")
+        # Also persist derived Jira server URL
+        if self._settings.get("jira_server_url"):
+            data["jira_server_url"] = self._settings["jira_server_url"]
         with open(SETTINGS_PATH, "w") as f:
             json.dump(data, f, indent=2)
         print("[voitta-auth] Settings saved")
 
     def show_settings(self, _):
         from AppKit import (
-            NSApp, NSAlert, NSFont,
-            NSTextField, NSView,
+            NSApp, NSAlert, NSButton, NSFont,
+            NSPopUpButton, NSTextField, NSView,
         )
         from Foundation import NSMakeRect
 
@@ -1268,12 +1555,25 @@ class VoittaAuthApp(rumps.App):
                     val = self._settings.get(base_key, "")
                 rows.append((field_label, val, settings_key, False))
 
-        # Calculate total height
+        rows.append(("Jira MCP .env:", self.jira_mcp_env_path, "jira_mcp_env_path", False))
+        rows.append(("── Jira ──", None, None, True))
+        # Jira URL/Email/Token as text fields; Project handled as popup below
+        jira_url_val = self._settings.get("jira_url", "")
+        parsed_project = ""
+        if jira_url_val:
+            _, parsed_project = _parse_jira_url(jira_url_val)
+        for settings_key, field_label in JIRA_SETTINGS_FIELDS:
+            if settings_key == "jira_project":
+                continue  # rendered as popup + fetch button below
+            rows.append((field_label, self._settings.get(settings_key, ""), settings_key, False))
+
+        # Calculate total height (generic rows + 1 extra row for popup+button)
         total_h = 0
         for i, (_, _, _, is_header) in enumerate(rows):
             total_h += header_h if is_header else row_h
             if i > 0:
                 total_h += gap
+        total_h += row_h + gap  # for "Project: [popup] [Fetch]" row
 
         container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, total_w, total_h))
         text_fields = []       # (settings_key, NSTextField)
@@ -1317,6 +1617,49 @@ class VoittaAuthApp(rumps.App):
 
             y_cursor -= gap
 
+        # ── Jira project popup + Fetch button ─────────────────────────────
+        y_cursor -= row_h
+        lbl = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(0, y_cursor + 1, label_w - 6, row_h)
+        )
+        lbl.setStringValue_("Project:")
+        lbl.setBezeled_(False)
+        lbl.setDrawsBackground_(False)
+        lbl.setEditable_(False)
+        lbl.setSelectable_(False)
+        lbl.setAlignment_(1)
+        container.addSubview_(lbl)
+
+        popup_w = field_w - 130
+        jira_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(label_w, y_cursor, popup_w, row_h), False
+        )
+        stored_project = self._settings.get("jira_project", "")
+        if stored_project:
+            jira_popup.addItemWithTitle_(stored_project)
+        else:
+            jira_popup.addItemWithTitle_("(click Fetch Projects)")
+        container.addSubview_(jira_popup)
+
+        fetch_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(label_w + popup_w + 8, y_cursor, 122, row_h)
+        )
+        fetch_btn.setTitle_("Fetch Projects")
+        fetch_btn.setBezelStyle_(1)  # NSRoundedBezelStyle
+        container.addSubview_(fetch_btn)
+
+        # Wire fetch helper to button
+        jira_tf = {k: f for k, f in text_fields if k.startswith("jira_")}
+        fetch_helper = _JiraFetchHelper.alloc().init()
+        fetch_helper._url_field = jira_tf.get("jira_url")
+        fetch_helper._email_field = jira_tf.get("jira_email")
+        fetch_helper._token_field = jira_tf.get("jira_api_token")
+        fetch_helper._popup = jira_popup
+        fetch_helper._btn = fetch_btn
+        fetch_helper._default_project = parsed_project or stored_project
+        fetch_btn.setTarget_(fetch_helper)
+        fetch_btn.setAction_("doFetch:")
+
         alert = NSAlert.alloc().init()
         alert.setMessageText_("Voitta Auth Settings")
         alert.setInformativeText_("Saved to ~/.voitta_auth_settings.json")
@@ -1341,8 +1684,17 @@ class VoittaAuthApp(rumps.App):
                 self.edit_proxy_url = val.rstrip("/") or self.edit_proxy_url
             elif settings_key == "edit_mcp_env_path":
                 self.edit_mcp_env_path = val or self.edit_mcp_env_path
+            elif settings_key == "jira_mcp_env_path":
+                self.jira_mcp_env_path = val or self.jira_mcp_env_path
             else:
                 self._settings[settings_key] = val
+
+        # Collect Jira project from popup
+        selected = jira_popup.titleOfSelectedItem()
+        if selected and not selected.startswith("("):
+            self._settings["jira_project"] = selected.split(" — ")[0].strip()
+        else:
+            self._settings["jira_project"] = ""
 
         self._save_settings()
 
@@ -1373,6 +1725,28 @@ class VoittaAuthApp(rumps.App):
 
         self._sync_edit_mcp_env()
 
+        # Detect Jira credential changes
+        jira_changed = any(
+            self._settings.get(k, "") != old_settings.get(k, "")
+            for k, _ in JIRA_SETTINGS_FIELDS
+        )
+        if jira_changed:
+            # Parse URL to extract server URL and default project
+            jira_url = self._settings.get("jira_url", "")
+            if jira_url:
+                server_url, parsed_project = _parse_jira_url(jira_url)
+                self._settings["jira_server_url"] = server_url
+                if not self._settings.get("jira_project", "") and parsed_project:
+                    self._settings["jira_project"] = parsed_project
+                print(f"[voitta-auth] Jira server: {server_url}, project: {self._settings.get('jira_project', '')}")
+            print("[voitta-auth] Jira credentials changed")
+            self._save_settings()
+            self._sync_jira_mcp_env()
+            self._update_menu_state()
+            # Fetch available projects in background
+            if self._has_jira_credentials() and self._settings.get("jira_server_url"):
+                threading.Thread(target=self._log_jira_projects, daemon=True).start()
+
     # ── Help ─────────────────────────────────────────────────────────────────
 
     def show_help(self, _):
@@ -1381,12 +1755,17 @@ class VoittaAuthApp(rumps.App):
         alert.setMessageText_("Voitta Auth Help")
         alert.setInformativeText_(
             "Voitta Auth sits in your menu bar.\n\n"
-            "Status: M G O  (M) (G)\n"
-            "  Bright = authenticated, dimmed = not authenticated\n"
-            "  Letters = RAG providers, circled = Edit providers\n\n"
-            "Activate/Deactivate each provider independently.\n\n"
+            "Status: M G O J  (M) (G)\n"
+            "  Bright = authenticated/configured, dimmed = not\n"
+            "  Letters = RAG providers + Jira, circled = Edit providers\n\n"
+            "Activate/Deactivate each provider independently.\n"
+            "Jira: paste a Jira URL to auto-detect server and project.\n"
+            "  Uses email + API token (no browser login).\n\n"
             f"RAG proxy: http://127.0.0.1:{PROXY_PORT} → {self.voitta_rag_url}\n"
-            f"Edit proxy: http://127.0.0.1:{EDIT_PROXY_PORT} → {self.edit_proxy_url}"
+            f"Edit proxy: http://127.0.0.1:{EDIT_PROXY_PORT} → {self.edit_proxy_url}\n"
+            f"Jira MCP: http://127.0.0.1:{JIRA_MCP_PORT}/mcp (mcp-atlassian)\n"
+            f"Google MCP dir: {GOOGLE_MCP_DIR}\n"
+            f"Jira MCP dir: {JIRA_MCP_DIR}"
         )
         alert.addButtonWithTitle_("OK")
         _show_modal(alert)
