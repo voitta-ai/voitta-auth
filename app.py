@@ -12,14 +12,24 @@ import subprocess
 import threading
 import traceback
 import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs
+
+import logging
 
 from dotenv import load_dotenv
 import msal
 import requests
 import rumps
+from fastmcp import FastMCP as FastMCPServer
+from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient
+from fastmcp.client.transports import StreamableHttpTransport
+
+# Surface FastMCP proxy errors (otherwise silently swallowed at DEBUG)
+logging.getLogger("fastmcp.server.providers.aggregate").setLevel(logging.DEBUG)
+logging.basicConfig(level=logging.WARNING, format="[%(name)s] %(levelname)s: %(message)s")
+logging.getLogger("fastmcp.server.providers.aggregate").setLevel(logging.DEBUG)
 from AppKit import (
     NSAttributedString, NSBezierPath, NSColor, NSFont, NSFontAttributeName,
     NSForegroundColorAttributeName, NSImage, NSMutableAttributedString,
@@ -137,7 +147,6 @@ EDIT_PROVIDER_ORDER = ("microsoft_edit", "google_edit")
 REDIRECT_PORT = int(os.environ.get("REDIRECT_PORT", "53214"))
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "18765"))
-EDIT_PROXY_PORT = int(os.environ.get("EDIT_PROXY_PORT", "18766"))
 JIRA_MCP_PORT = int(os.environ.get("JIRA_MCP_PORT", "18767"))
 VOITTA_RAG_URL = os.environ.get("VOITTA_RAG_URL", "https://rag.voitta.ai")
 EDIT_PROXY_URL = os.environ.get("EDIT_PROXY_URL", "http://localhost:8000")
@@ -239,13 +248,6 @@ class _JiraFetchHelper(NSObject):
                 if key == default_proj:
                     selected_idx = i
             self._popup.selectItemAtIndex_(selected_idx)
-
-
-# Hop-by-hop headers that must not be forwarded
-HOP_BY_HOP = frozenset([
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade",
-])
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -355,182 +357,6 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
         pass
 
 
-class ProxyHandler(BaseHTTPRequestHandler):
-    """HTTP pass-through proxy that injects auth headers for all authenticated providers."""
-
-    voitta_app = None
-
-    def _proxy(self):
-        app = self.__class__.voitta_app
-        base_url = app.voitta_rag_url if app else VOITTA_RAG_URL
-        target_url = base_url.rstrip("/") + self.path
-        print(f"[proxy] {self.command} {self.path} → {target_url}")
-
-        headers = {
-            k: v for k, v in self.headers.items()
-            if k.lower() not in HOP_BY_HOP and k.lower() != "host"
-        }
-
-        # Inject auth headers for all authenticated providers
-        any_injected = False
-        if app:
-            for key in PROVIDER_ORDER:
-                state = app._auth[key]
-                if not state["token"]:
-                    continue
-                suffix = PROVIDERS[key]["label"]
-                headers[f"X-Auth-Token-{suffix}"] = f"Bearer {state['token']}"
-                if state["profile"]:
-                    headers[f"X-Auth-Email-{suffix}"] = state["profile"].get("email", "")
-                    headers[f"X-Auth-Name-{suffix}"] = state["profile"].get("name", "")
-                any_injected = True
-                print(f"[proxy] {key} auth injected")
-
-        if not any_injected:
-            print("[proxy] WARNING: no tokens available, forwarding unauthenticated")
-
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length) if content_length else None
-        if body:
-            print(f"[proxy] body ({content_length}b): {body[:200]}")
-
-        try:
-            resp = requests.request(
-                self.command, target_url,
-                headers=headers, data=body,
-                stream=True, timeout=(10, None),
-            )
-        except Exception as e:
-            print(f"[proxy] ERROR connecting to upstream: {e}")
-            self.send_error(502, f"Proxy error: {e}")
-            return
-
-        print(f"[proxy] upstream response: {resp.status_code} {resp.reason}")
-        if resp.status_code >= 400:
-            print(f"[proxy] upstream headers: {dict(resp.headers)}")
-            body_preview = resp.content[:500]
-            print(f"[proxy] upstream error body: {body_preview}")
-            self.send_response(resp.status_code)
-            for k, v in resp.headers.items():
-                if k.lower() not in HOP_BY_HOP:
-                    self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(body_preview)
-            return
-
-        self.send_response(resp.status_code)
-        for k, v in resp.headers.items():
-            if k.lower() not in HOP_BY_HOP:
-                self.send_header(k, v)
-        self.end_headers()
-
-        try:
-            for chunk in resp.iter_content(chunk_size=None):
-                if chunk:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-    def do_GET(self): self._proxy()
-    def do_POST(self): self._proxy()
-    def do_PUT(self): self._proxy()
-    def do_DELETE(self): self._proxy()
-    def do_PATCH(self): self._proxy()
-    def do_HEAD(self): self._proxy()
-    def do_OPTIONS(self): self._proxy()
-
-    def log_message(self, format, *args):
-        pass
-
-
-class EditProxyHandler(BaseHTTPRequestHandler):
-    """HTTP proxy that injects edit auth tokens as standard Authorization headers."""
-
-    voitta_app = None
-
-    def _proxy(self):
-        app = self.__class__.voitta_app
-        base_url = app.edit_proxy_url if app else EDIT_PROXY_URL
-        target_url = base_url.rstrip("/") + self.path
-        print(f"[edit-proxy] {self.command} {self.path} → {target_url}")
-
-        headers = {
-            k: v for k, v in self.headers.items()
-            if k.lower() not in HOP_BY_HOP and k.lower() != "host"
-        }
-
-        # Inject Authorization: Bearer from the first available edit provider
-        injected = False
-        if app:
-            for key in EDIT_PROVIDER_ORDER:
-                state = app._auth[key]
-                if state["token"]:
-                    headers["Authorization"] = f"Bearer {state['token']}"
-                    if state["profile"]:
-                        headers["X-Auth-Email"] = state["profile"].get("email", "")
-                        headers["X-Auth-Name"] = state["profile"].get("name", "")
-                    injected = True
-                    print(f"[edit-proxy] {key} auth injected")
-                    break
-
-        if not injected:
-            print("[edit-proxy] WARNING: no edit tokens available, forwarding unauthenticated")
-
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length) if content_length else None
-        if body:
-            print(f"[edit-proxy] body ({content_length}b): {body[:200]}")
-
-        try:
-            resp = requests.request(
-                self.command, target_url,
-                headers=headers, data=body,
-                stream=True, timeout=(10, None),
-            )
-        except Exception as e:
-            print(f"[edit-proxy] ERROR connecting to upstream: {e}")
-            self.send_error(502, f"Proxy error: {e}")
-            return
-
-        print(f"[edit-proxy] upstream response: {resp.status_code} {resp.reason}")
-        if resp.status_code >= 400:
-            print(f"[edit-proxy] upstream headers: {dict(resp.headers)}")
-            body_preview = resp.content[:500]
-            print(f"[edit-proxy] upstream error body: {body_preview}")
-            self.send_response(resp.status_code)
-            for k, v in resp.headers.items():
-                if k.lower() not in HOP_BY_HOP:
-                    self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(body_preview)
-            return
-
-        self.send_response(resp.status_code)
-        for k, v in resp.headers.items():
-            if k.lower() not in HOP_BY_HOP:
-                self.send_header(k, v)
-        self.end_headers()
-
-        try:
-            for chunk in resp.iter_content(chunk_size=None):
-                if chunk:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-    def do_GET(self): self._proxy()
-    def do_POST(self): self._proxy()
-    def do_PUT(self): self._proxy()
-    def do_DELETE(self): self._proxy()
-    def do_PATCH(self): self._proxy()
-    def do_HEAD(self): self._proxy()
-    def do_OPTIONS(self): self._proxy()
-
-    def log_message(self, format, *args):
-        pass
-
 
 # ── Main application ─────────────────────────────────────────────────────────
 
@@ -556,9 +382,6 @@ class VoittaAuthApp(rumps.App):
                 "refresh_timer": None,
                 "msal_app": None,
             }
-
-        ProxyHandler.voitta_app = self
-        EditProxyHandler.voitta_app = self
 
         # Load persistent settings
         self._settings = self._load_settings()
@@ -624,9 +447,8 @@ class VoittaAuthApp(rumps.App):
 
         self._update_menu_state()
 
-        # Start MCP proxy servers
-        threading.Thread(target=self._run_proxy, daemon=True).start()
-        threading.Thread(target=self._run_edit_proxy, daemon=True).start()
+        # Start unified FastMCP proxy server
+        threading.Thread(target=self._run_fastmcp_proxy, daemon=True).start()
 
     # ── Menu state ───────────────────────────────────────────────────────────
 
@@ -1423,17 +1245,77 @@ class VoittaAuthApp(rumps.App):
         _notify("Voitta Auth", label, "Signed out.")
         self._update_menu_state()
 
-    # ── Proxy ────────────────────────────────────────────────────────────────
+    # ── FastMCP Proxy ─────────────────────────────────────────────────────────
 
-    def _run_proxy(self):
-        server = ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
-        print(f"[voitta-auth] Proxy listening on http://127.0.0.1:{PROXY_PORT} → {self.voitta_rag_url}")
-        server.serve_forever()
+    def _make_rag_client_factory(self):
+        """Return a factory that creates a ProxyClient with current RAG auth headers."""
+        app = self
+        def factory():
+            headers = {}
+            for key in PROVIDER_ORDER:
+                state = app._auth[key]
+                if not state["token"]:
+                    continue
+                suffix = PROVIDERS[key]["label"]
+                headers[f"X-Auth-Token-{suffix}"] = f"Bearer {state['token']}"
+                if state["profile"]:
+                    headers[f"X-Auth-Email-{suffix}"] = state["profile"].get("email", "")
+                    headers[f"X-Auth-Name-{suffix}"] = state["profile"].get("name", "")
+            url = f"{app.voitta_rag_url.rstrip('/')}/mcp/mcp"
+            print(f"[voitta-auth] RAG factory: url={url}, {len(headers)} headers")
+            transport = StreamableHttpTransport(url=url, headers=headers)
+            return ProxyClient(transport)
+        return factory
 
-    def _run_edit_proxy(self):
-        server = ThreadingHTTPServer(("127.0.0.1", EDIT_PROXY_PORT), EditProxyHandler)
-        print(f"[voitta-auth] Edit proxy listening on http://127.0.0.1:{EDIT_PROXY_PORT} → {self.edit_proxy_url}")
-        server.serve_forever()
+    def _make_google_client_factory(self):
+        """Return a factory that creates a ProxyClient with current edit Bearer token."""
+        app = self
+        def factory():
+            headers = {}
+            for key in EDIT_PROVIDER_ORDER:
+                state = app._auth[key]
+                if state["token"]:
+                    headers["Authorization"] = f"Bearer {state['token']}"
+                    if state["profile"]:
+                        headers["X-Auth-Email"] = state["profile"].get("email", "")
+                        headers["X-Auth-Name"] = state["profile"].get("name", "")
+                    break
+            url = f"{app.edit_proxy_url.rstrip('/')}/mcp"
+            print(f"[voitta-auth] Google factory: url={url}, headers={list(headers.keys())}")
+            transport = StreamableHttpTransport(url=url, headers=headers)
+            return ProxyClient(transport)
+        return factory
+
+    def _run_fastmcp_proxy(self):
+        """Run unified FastMCP proxy server mounting all backends."""
+        main_server = FastMCPServer("voitta-auth")
+
+        # RAG proxy with dynamic per-provider auth headers
+        rag_proxy = FastMCPProxy(
+            client_factory=self._make_rag_client_factory(),
+            name="voitta-rag",
+        )
+        main_server.mount(rag_proxy, prefix="voitta_rag")
+
+        # Google Workspace proxy with dynamic Bearer token
+        google_proxy = FastMCPProxy(
+            client_factory=self._make_google_client_factory(),
+            name="google-sheets",
+        )
+        main_server.mount(google_proxy, prefix="google_sheets")
+
+        # Jira proxy (credentials already in subprocess .env)
+        jira_proxy = FastMCPServer.as_proxy(
+            f"http://localhost:{JIRA_MCP_PORT}/mcp",
+            name="jira",
+        )
+        main_server.mount(jira_proxy, prefix="jira")
+
+        print(f"[voitta-auth] FastMCP proxy on http://127.0.0.1:{PROXY_PORT}/mcp")
+        print(f"[voitta-auth]   RAG → {self.voitta_rag_url}")
+        print(f"[voitta-auth]   Google → {self.edit_proxy_url}")
+        print(f"[voitta-auth]   Jira → http://localhost:{JIRA_MCP_PORT}/mcp")
+        main_server.run(transport="streamable-http", host="127.0.0.1", port=PROXY_PORT)
 
     # ── MCP subprocess management ────────────────────────────────────────────
 
@@ -1761,9 +1643,10 @@ class VoittaAuthApp(rumps.App):
             "Activate/Deactivate each provider independently.\n"
             "Jira: paste a Jira URL to auto-detect server and project.\n"
             "  Uses email + API token (no browser login).\n\n"
-            f"RAG proxy: http://127.0.0.1:{PROXY_PORT} → {self.voitta_rag_url}\n"
-            f"Edit proxy: http://127.0.0.1:{EDIT_PROXY_PORT} → {self.edit_proxy_url}\n"
-            f"Jira MCP: http://127.0.0.1:{JIRA_MCP_PORT}/mcp (mcp-atlassian)\n"
+            f"MCP proxy: http://127.0.0.1:{PROXY_PORT}/mcp (unified)\n"
+            f"  RAG → {self.voitta_rag_url}\n"
+            f"  Google → {self.edit_proxy_url}\n"
+            f"  Jira → http://127.0.0.1:{JIRA_MCP_PORT}/mcp\n"
             f"Google MCP dir: {GOOGLE_MCP_DIR}\n"
             f"Jira MCP dir: {JIRA_MCP_DIR}"
         )

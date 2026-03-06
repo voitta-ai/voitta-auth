@@ -1,16 +1,16 @@
 # Voitta Auth
 
-A macOS menu bar application that authenticates users via multiple identity providers (Microsoft, Google, Okta) and runs local HTTP proxies that inject auth headers into requests to MCP servers. Also proxies the Atlassian-hosted Jira MCP server with Basic Auth injection. Designed for use with [Claude Code](https://claude.com/claude-code).
+A macOS menu bar application that authenticates users via multiple identity providers (Microsoft, Google, Okta) and runs a unified [FastMCP](https://gofastmcp.com) proxy that mounts multiple MCP backends under a single endpoint, injecting credentials where necessary. Designed for use with [Claude Code](https://claude.com/claude-code).
 
 ## How It Works
 
 1. Sits in the macOS menu bar showing `M G O J` (RAG providers + Jira) and circled `(M) (G)` (Edit providers). Bright when authenticated/configured, dimmed when not. Adapts to the system light/dark theme
 2. Each provider can be activated/deactivated independently
 3. On activation, opens the provider's login page in the browser and captures the OAuth2 callback
-4. Runs two local HTTP proxies:
-   - **RAG proxy** (default `http://127.0.0.1:18765`) — forwards to [voitta-rag](https://github.com/voitta-ai/voitta-rag), injects per-provider `X-Auth-Token-*` headers
-   - **Edit proxy** (default `http://127.0.0.1:18766`) — forwards to a workspace MCP server, injects standard `Authorization: Bearer` header
-   - **Jira proxy** (default `http://127.0.0.1:18767`) — forwards to the Atlassian-hosted Jira MCP server, injects `Authorization: Basic` header
+4. Runs a unified FastMCP proxy (default `http://127.0.0.1:18765/mcp`) that mounts three backends:
+   - **voitta_rag** — forwards to [voitta-rag](https://github.com/voitta-ai/voitta-rag), injects per-provider `X-Auth-Token-*` headers
+   - **google_sheets** — forwards to a Google Workspace MCP server, injects `Authorization: Bearer` header
+   - **jira** — forwards to mcp-atlassian subprocess (credentials via `.env`)
 5. Edit providers use broader OAuth scopes for document editing (Sheets, Docs, Slides, Drive for Google; Files, Sites for Microsoft)
 6. Jira uses static credentials (email + API token) — no browser login or token refresh needed
 7. OAuth tokens are held in memory and refreshed automatically while the app is running
@@ -121,20 +121,19 @@ Initial values come from `.env` (see `.env.sample`). After first launch, use the
 | `OKTA_DOMAIN` | Okta | Okta org domain (e.g. `dev-123456.okta.com`) |
 | `OKTA_CLIENT_ID` | Okta | OIDC client ID |
 | `REDIRECT_PORT` | All | Local port for OAuth callback (default: `53214`) |
-| `PROXY_PORT` | RAG | Local port for the RAG proxy (default: `18765`) |
+| `PROXY_PORT` | All | Local port for the unified MCP proxy (default: `18765`) |
 | `VOITTA_RAG_URL` | RAG | Upstream voitta-rag URL (default: `https://rag.voitta.ai`) |
-| `EDIT_PROXY_PORT` | Edit | Local port for the edit proxy (default: `18766`) |
-| `EDIT_PROXY_URL` | Edit | Upstream workspace MCP URL (default: `http://localhost:8000`) |
+| `EDIT_PROXY_URL` | Edit | Upstream Google Workspace MCP URL (default: `http://localhost:8000`) |
 | `EDIT_MCP_ENV_PATH` | Edit | Path to the workspace MCP server's `.env` file (default: `~/DEVEL/google_workspace_mcp/.env`) |
 | `JIRA_EMAIL` | Jira | Atlassian account email |
 | `JIRA_API_TOKEN` | Jira | Atlassian API token |
-| `JIRA_PROXY_PORT` | Jira | Local port for the Jira proxy (default: `18767`) |
+| `JIRA_MCP_PORT` | Jira | Port for the mcp-atlassian subprocess (default: `18767`) |
 
 Edit provider credentials default to the same values as the corresponding RAG provider. Override them in Settings to use separate OAuth apps.
 
-### RAG Proxy Headers
+### RAG Backend Headers
 
-The RAG proxy (port 18765) injects per-provider headers for every authenticated RAG provider:
+The `voitta_rag` proxy backend injects per-provider headers for every authenticated RAG provider:
 
 | Header | Description |
 |--------|-------------|
@@ -148,9 +147,9 @@ The RAG proxy (port 18765) injects per-provider headers for every authenticated 
 | `X-Auth-Email-Okta` | User email from Okta |
 | `X-Auth-Name-Okta` | Display name from Okta |
 
-### Edit Proxy Headers
+### Google Workspace Backend Headers
 
-The Edit proxy (port 18766) injects a single standard `Authorization` header from the first available edit provider:
+The `google_sheets` proxy backend injects a single standard `Authorization` header from the first available edit provider:
 
 | Header | Description |
 |--------|-------------|
@@ -160,13 +159,9 @@ The Edit proxy (port 18766) injects a single standard `Authorization` header fro
 
 This is designed for use with [google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp) in `EXTERNAL_OAUTH21_PROVIDER=true` mode, or any MCP server that accepts standard Bearer tokens.
 
-### Jira Proxy Headers
+### Jira Backend
 
-The Jira proxy (port 18767) injects the stored credentials as a Basic Auth header and forwards all requests to the Atlassian-hosted MCP server at `https://mcp.atlassian.com/v1/mcp`:
-
-| Header | Description |
-|--------|-------------|
-| `Authorization` | `Basic base64(email:token)` from Jira credentials in Settings |
+The `jira` proxy backend forwards to the local mcp-atlassian subprocess (port 18767). Jira credentials are passed to mcp-atlassian via its `.env` file — no header injection needed at the proxy level.
 
 ### Automatic MCP Server Configuration
 
@@ -188,20 +183,14 @@ Add the following to your `claude_desktop_config.json` or `.claude/settings.json
 ```json
 {
   "mcpServers": {
-    "voitta-rag": {
+    "voitta": {
       "url": "http://127.0.0.1:18765/mcp"
-    },
-    "google-workspace": {
-      "url": "http://127.0.0.1:18766/mcp"
-    },
-    "jira": {
-      "url": "http://127.0.0.1:18767/mcp"
     }
   }
 }
 ```
 
-The Jira MCP server (hosted by Atlassian at `mcp.atlassian.com`) supports read and write operations — creating, updating, searching, and bulk-creating Jira issues. Voitta-auth proxies the connection and handles authentication, so clients don't need to know the API token.
+All backends are exposed through this single endpoint. Tools are namespaced with prefixes: `voitta_rag_*`, `google_sheets_*`, `jira_*`.
 
 ## License
 
