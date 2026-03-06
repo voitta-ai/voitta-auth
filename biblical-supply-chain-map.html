@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ancient Biblical Supply Chains</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="https://d3js.org/topojson.v3.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=Crimson+Text:ital,wght@0,400;0,600;1,400&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #2c1810;
+    color: #3b2314;
+    font-family: 'Crimson Text', Georgia, serif;
+    overflow: hidden;
+  }
+
+  #map-container {
+    width: 100vw;
+    height: 100vh;
+    position: relative;
+    background: radial-gradient(ellipse at center, #e8d5b7 0%, #d4b896 40%, #c4a67a 70%, #8b6914 100%);
+  }
+
+  svg {
+    width: 100%;
+    height: 100%;
+  }
+
+  .land {
+    fill: #d4b896;
+    stroke: #a08060;
+    stroke-width: 0.5;
+  }
+
+  .water {
+    fill: #8bb8c4;
+    opacity: 0.3;
+  }
+
+  .title-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    text-align: center;
+    padding: 16px 20px 12px;
+    background: linear-gradient(180deg, rgba(44,24,16,0.85) 0%, rgba(44,24,16,0.4) 70%, transparent 100%);
+    pointer-events: none;
+  }
+
+  .title-bar h1 {
+    font-family: 'Cinzel', serif;
+    font-size: 28px;
+    font-weight: 700;
+    color: #f0e0c8;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    text-shadow: 1px 2px 4px rgba(0,0,0,0.5);
+  }
+
+  .title-bar p {
+    font-family: 'Crimson Text', serif;
+    font-size: 15px;
+    color: #c8b090;
+    font-style: italic;
+    margin-top: 2px;
+  }
+
+  .legend {
+    position: absolute;
+    bottom: 20px;
+    left: 20px;
+    background: rgba(44, 24, 16, 0.9);
+    border: 1px solid #8b6914;
+    border-radius: 8px;
+    padding: 14px 16px;
+    max-height: calc(100vh - 120px);
+    overflow-y: auto;
+    width: 320px;
+  }
+
+  .legend h3 {
+    font-family: 'Cinzel', serif;
+    font-size: 14px;
+    color: #f0e0c8;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    border-bottom: 1px solid #8b6914;
+    padding-bottom: 6px;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 5px 4px;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: background 0.2s;
+  }
+
+  .legend-item:hover {
+    background: rgba(139, 105, 20, 0.3);
+  }
+
+  .legend-item.active {
+    background: rgba(139, 105, 20, 0.5);
+  }
+
+  .legend-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-top: 3px;
+    border: 1px solid rgba(240, 224, 200, 0.4);
+  }
+
+  .legend-text {
+    font-size: 13px;
+    color: #d4b896;
+    line-height: 1.3;
+  }
+
+  .legend-text strong {
+    color: #f0e0c8;
+    font-family: 'Cinzel', serif;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+  }
+
+  .legend-text .desc {
+    display: block;
+    font-size: 11.5px;
+    color: #a08060;
+    font-style: italic;
+  }
+
+  .tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: rgba(44, 24, 16, 0.95);
+    border: 1px solid #8b6914;
+    border-radius: 6px;
+    padding: 10px 14px;
+    max-width: 300px;
+    opacity: 0;
+    transition: opacity 0.2s;
+    z-index: 100;
+  }
+
+  .tooltip h4 {
+    font-family: 'Cinzel', serif;
+    font-size: 13px;
+    color: #f0e0c8;
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+  }
+
+  .tooltip p {
+    font-size: 12.5px;
+    color: #c8b090;
+    line-height: 1.4;
+  }
+
+  .tooltip .ref {
+    font-size: 11px;
+    color: #8b6914;
+    font-style: italic;
+    margin-top: 4px;
+  }
+
+  .marker-pulse {
+    animation: pulse 2.5s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 0.6; r: 8; }
+    50% { opacity: 0.2; r: 14; }
+  }
+
+  .route {
+    fill: none;
+    stroke-width: 2;
+    stroke-dasharray: 6, 4;
+    opacity: 0.55;
+    transition: opacity 0.4s;
+  }
+
+  .route.highlighted {
+    opacity: 1;
+    stroke-width: 3.5;
+  }
+
+  .route.dimmed {
+    opacity: 0.1;
+  }
+
+  .route.disrupted {
+    stroke-dasharray: 3, 6;
+    opacity: 0.4;
+  }
+
+  .route.disrupted.highlighted {
+    opacity: 0.8;
+    stroke-width: 3.5;
+  }
+
+  .route.disrupted.dimmed {
+    opacity: 0.08;
+  }
+
+  .place-label {
+    font-family: 'Cinzel', serif;
+    font-size: 10px;
+    fill: #3b2314;
+    pointer-events: none;
+    text-shadow: 0 0 3px #e8d5b7, 0 0 3px #e8d5b7, 0 0 3px #e8d5b7;
+  }
+
+  .hint {
+    position: absolute;
+    bottom: 20px;
+    right: 20px;
+    font-size: 12px;
+    color: #8b6914;
+    font-style: italic;
+    background: rgba(44, 24, 16, 0.7);
+    padding: 6px 12px;
+    border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+
+<div id="map-container">
+  <svg id="map"></svg>
+  <div class="title-bar">
+    <h1>Supply Chains of the Ancient World</h1>
+    <p>Trade, logistics &amp; inventory management in the Bible</p>
+  </div>
+  <div class="legend" id="legend"></div>
+  <div class="tooltip" id="tooltip"></div>
+  <div class="hint">Click a story to isolate its routes &bull; Hover for details &bull; Scroll to zoom</div>
+</div>
+
+<script>
+const stories = [
+  {
+    id: 'joseph',
+    name: "Joseph's Grain Reserve",
+    color: '#e6a832',
+    desc: 'Demand forecasting & strategic reserves',
+    ref: 'Genesis 41-47',
+    detail: 'Joseph forecasts 7 years of famine, builds granary network across Egypt. Opens storehouses and sells to all nations. When money runs out, accepts cattle, then land as payment.',
+    locations: ['egypt_memphis'],
+    routes: [['canaan','egypt_memphis'], ['damascus','egypt_memphis']],
+  },
+  {
+    id: 'tyre',
+    name: 'Tyre Trade Hub',
+    color: '#4ca6e8',
+    desc: 'Ancient multi-origin trade network',
+    ref: 'Ezekiel 27',
+    detail: 'Tyre sourced from 15+ nations: silver & iron from Tarshish, horses from Togarmah, ivory from Dedan, emeralds from Syria, wheat from Israel, spices from Sheba. Ships of Tarshish carried goods by sea.',
+    locations: ['tyre'],
+    routes: [['tarshish','tyre'],['togarmah','tyre'],['dedan','tyre'],['damascus','tyre'],['sheba','tyre'],['jerusalem','tyre'],['javan','tyre'],['egypt_memphis','tyre']],
+  },
+  {
+    id: 'solomon_trade',
+    name: "Solomon's Trade Empire",
+    color: '#d4a017',
+    desc: 'Maritime fleet & import/export',
+    ref: '1 Kings 9-10, 2 Chr 9',
+    detail: 'Ships of Tarshish sailed to Ophir every 3 years returning with gold, silver, ivory, apes & peacocks. 666 talents of gold/year. Imported horses from Egypt, exported chariots to Hittites & Syria.',
+    locations: ['jerusalem'],
+    routes: [['jerusalem','ophir'],['jerusalem','tarshish'],['egypt_memphis','jerusalem'],['jerusalem','sheba'],['jerusalem','hittites']],
+  },
+  {
+    id: 'babylon_fall',
+    name: 'Fall of Babylon',
+    color: '#c0392b',
+    desc: 'Total market collapse — 28 commodities',
+    ref: 'Revelation 18',
+    detail: 'A 28-commodity bill of lading: gold, silver, gems, linen, silk, spices, wine, oil, wheat, cattle, horses, chariots — ending with "slaves, and souls of men." Merchants weep as trade ceases entirely.',
+    locations: ['babylon'],
+    routes: [['tarshish','babylon'],['tyre','babylon'],['sheba','babylon'],['egypt_memphis','babylon'],['damascus','babylon']],
+    disrupted: true,
+  },
+  {
+    id: 'hiram_timber',
+    name: 'Solomon-Hiram Timber',
+    color: '#27ae60',
+    desc: 'International procurement contract',
+    ref: '1 Kings 5',
+    detail: 'Cedar & fir from Lebanon, floated as log rafts down the coast to Joppa. Payment: 20,000 measures each of wheat, barley, wine & oil. 30,000 workers in monthly rotations, 80,000 stone cutters.',
+    locations: ['lebanon', 'jerusalem'],
+    routes: [['lebanon','tyre'],['tyre','joppa'],['joppa','jerusalem']],
+  },
+  {
+    id: 'bricks',
+    name: "Pharaoh's Brick Disruption",
+    color: '#e67e22',
+    desc: 'Raw material supply cut, same quotas',
+    ref: 'Exodus 5',
+    detail: 'Israelites made bricks with Egyptian-supplied straw. Pharaoh cuts straw supply but keeps production quotas: "Ye shall not diminish ought thereof." The original supply chain squeeze.',
+    locations: ['egypt_goshen'],
+    routes: [['egypt_memphis','egypt_goshen']],
+    disrupted: true,
+  },
+  {
+    id: 'manna',
+    name: 'Manna — 40-Year JIT',
+    color: '#f5d76e',
+    desc: 'Daily rations, zero-stockpile policy',
+    ref: 'Exodus 16, Numbers 11',
+    detail: 'Daily bread rations with enforced perishability — overnight stock bred worms. Double portion Fridays for Sabbath (only safety stock). Quail airlifted by wind. System ran 40 years.',
+    locations: ['sinai'],
+    routes: [],
+  },
+  {
+    id: 'ark',
+    name: "Noah's Ark",
+    color: '#8e6d47',
+    desc: 'Mega-project build & provisioning',
+    ref: 'Genesis 6',
+    detail: 'Specs: 300 x 50 x 30 cubits (~450ft long), 3 stories, gopher wood, sealed with pitch. Stocked with breeding pairs of all species plus food stores for unknown duration.',
+    locations: ['ararat'],
+    routes: [],
+  },
+  {
+    id: 'nehemiah',
+    name: "Nehemiah's Wall",
+    color: '#9b59b6',
+    desc: '52-day agile construction sprint',
+    ref: 'Nehemiah 4-6',
+    detail: 'Rebuilt Jerusalem walls in 52 days under hostile threats. Workers built with one hand, held weapons with the other. Sanballat & Tobiah ran sabotage and disinformation campaigns.',
+    locations: ['jerusalem'],
+    routes: [],
+  },
+  {
+    id: 'tabernacle',
+    name: 'Tabernacle Crowdfunding',
+    color: '#1abc9c',
+    desc: 'Supply exceeded demand — stop order issued',
+    ref: 'Exodus 36',
+    detail: 'Moses called for voluntary material donations. People brought so much it was "sufficient...and too much." Moses issued a stop order: "Let neither man nor woman make any more work."',
+    locations: ['sinai'],
+    routes: [],
+  },
+  {
+    id: 'caravan',
+    name: 'Ishmaelite Caravan',
+    color: '#e8836b',
+    desc: 'Spice trade route — Gilead to Egypt',
+    ref: 'Genesis 37',
+    detail: 'Ishmaelite camel caravan carrying spicery, balm, and myrrh from Gilead to Egypt. Joseph was sold to these traders for 20 pieces of silver and carried along this ancient trade corridor.',
+    locations: ['gilead', 'egypt_memphis'],
+    routes: [['gilead','dothan'],['dothan','egypt_memphis']],
+  },
+  {
+    id: 'samaria_siege',
+    name: 'Siege of Samaria',
+    color: '#e74c3c',
+    desc: 'Supply blockade & hyperinflation',
+    ref: '2 Kings 6:24-25',
+    detail: "Benhadad of Syria besieges Samaria. Extreme scarcity pricing: an ass's head sold for 80 pieces of silver, a quarter cab of dove's dung for 5 silver. A textbook supply blockade causing hyperinflation.",
+    locations: ['samaria'],
+    routes: [['damascus','samaria']],
+    disrupted: true,
+  },
+  {
+    id: 'paul_grain_ship',
+    name: "Paul's Grain Ship",
+    color: '#3498db',
+    desc: 'Alexandrian wheat freighter to Rome',
+    ref: 'Acts 27-28',
+    detail: 'Paul sails as prisoner on an Alexandrian grain freighter — the tanker ships of antiquity hauling Egyptian wheat to feed Rome. 276 souls aboard. Storm forces them to jettison the wheat cargo. Shipwrecked at Malta, then onward to Rome.',
+    locations: ['malta'],
+    routes: [['alexandria','myra'],['myra','crete'],['crete','malta'],['malta','syracuse'],['syracuse','puteoli'],['puteoli','rome']],
+  },
+];
+
+const places = {
+  egypt_memphis:  { name: 'Memphis (Egypt)',   lon: 31.25, lat: 29.85 },
+  egypt_goshen:   { name: 'Goshen',            lon: 31.9,  lat: 30.8 },
+  jerusalem:      { name: 'Jerusalem',         lon: 35.23, lat: 31.77 },
+  tyre:           { name: 'Tyre',              lon: 35.20, lat: 33.27 },
+  lebanon:        { name: 'Lebanon (Cedars)',   lon: 35.85, lat: 34.2 },
+  damascus:       { name: 'Damascus',          lon: 36.29, lat: 33.51 },
+  babylon:        { name: 'Babylon',           lon: 44.42, lat: 32.54 },
+  tarshish:       { name: 'Tarshish',          lon: -5.99, lat: 36.72 },
+  ophir:          { name: 'Ophir',             lon: 45.0,  lat: 12.5 },
+  sheba:          { name: 'Sheba',             lon: 45.5,  lat: 15.4 },
+  ararat:         { name: 'Mt. Ararat',        lon: 44.30, lat: 39.70 },
+  sinai:          { name: 'Sinai Wilderness',  lon: 33.97, lat: 28.55 },
+  gilead:         { name: 'Gilead',            lon: 35.85, lat: 32.3 },
+  joppa:          { name: 'Joppa',             lon: 34.75, lat: 32.05 },
+  dedan:          { name: 'Dedan',             lon: 38.8,  lat: 26.5 },
+  togarmah:       { name: 'Togarmah',          lon: 36.5,  lat: 38.5 },
+  javan:          { name: 'Javan (Greece)',     lon: 23.7,  lat: 37.9 },
+  canaan:         { name: 'Canaan',            lon: 35.3,  lat: 32.5 },
+  hittites:       { name: 'Hittite Lands',     lon: 34.6,  lat: 39.9 },
+  dothan:         { name: 'Dothan',            lon: 35.4,  lat: 32.4 },
+  samaria:        { name: 'Samaria',           lon: 35.19, lat: 32.28 },
+  alexandria:     { name: 'Alexandria',        lon: 29.92, lat: 31.20 },
+  myra:           { name: 'Myra',              lon: 29.98, lat: 36.26 },
+  crete:          { name: 'Crete',             lon: 24.90, lat: 35.24 },
+  malta:          { name: 'Malta',             lon: 14.51, lat: 35.90 },
+  syracuse:       { name: 'Syracuse',          lon: 15.29, lat: 37.07 },
+  puteoli:        { name: 'Puteoli',           lon: 14.12, lat: 40.82 },
+  rome:           { name: 'Rome',              lon: 12.50, lat: 41.90 },
+};
+
+// Collect which places are used
+const usedPlaces = new Set();
+stories.forEach(s => {
+  s.locations.forEach(l => usedPlaces.add(l));
+  s.routes.forEach(r => { usedPlaces.add(r[0]); usedPlaces.add(r[1]); });
+});
+
+const width = window.innerWidth;
+const height = window.innerHeight;
+
+const svg = d3.select('#map')
+  .attr('width', width)
+  .attr('height', height);
+
+// Background water
+svg.append('rect')
+  .attr('width', width)
+  .attr('height', height)
+  .attr('fill', '#a8ccd7')
+  .attr('opacity', 0.35);
+
+const projection = d3.geoMercator()
+  .center([33, 31])
+  .scale(Math.min(width, height) * 1.8)
+  .translate([width / 2, height / 2]);
+
+const path = d3.geoPath().projection(projection);
+
+const g = svg.append('g');
+
+// Decorative compass
+const compassG = svg.append('g')
+  .attr('transform', `translate(${width - 80}, 100)`);
+compassG.append('circle').attr('r', 25).attr('fill', 'none').attr('stroke', '#8b6914').attr('stroke-width', 1).attr('opacity', 0.6);
+compassG.append('text').text('N').attr('text-anchor', 'middle').attr('y', -30)
+  .attr('font-family', 'Cinzel, serif').attr('font-size', 14).attr('fill', '#8b6914').attr('opacity', 0.7);
+compassG.append('line').attr('x1', 0).attr('y1', -20).attr('x2', 0).attr('y2', 20)
+  .attr('stroke', '#8b6914').attr('stroke-width', 1.5).attr('opacity', 0.5);
+compassG.append('line').attr('x1', -20).attr('y1', 0).attr('x2', 20).attr('y2', 0)
+  .attr('stroke', '#8b6914').attr('stroke-width', 1.5).attr('opacity', 0.5);
+// Arrow head north
+compassG.append('polygon').attr('points', '0,-22 -4,-14 4,-14').attr('fill', '#8b6914').attr('opacity', 0.6);
+
+// Load world map
+const worldUrl = 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json';
+
+d3.json(worldUrl).then(world => {
+  const countries = topojson.feature(world, world.objects.countries);
+
+  // Draw land with parchment texture effect
+  g.selectAll('.land')
+    .data(countries.features)
+    .join('path')
+    .attr('class', 'land')
+    .attr('d', path)
+    .attr('fill', (d, i) => {
+      const fills = ['#d4b896', '#cdb08a', '#dabe9e', '#c8a880'];
+      return fills[i % fills.length];
+    });
+
+  // Sea labels
+  const seaLabels = [
+    { name: 'Mediterranean Sea', lon: 22, lat: 35.5, size: 14 },
+    { name: 'Red Sea', lon: 37.5, lat: 22, size: 11 },
+    { name: 'Persian Gulf', lon: 50, lat: 27, size: 10 },
+  ];
+
+  g.selectAll('.sea-label')
+    .data(seaLabels)
+    .join('text')
+    .attr('class', 'sea-label')
+    .attr('x', d => projection([d.lon, d.lat])[0])
+    .attr('y', d => projection([d.lon, d.lat])[1])
+    .text(d => d.name)
+    .attr('font-family', 'Crimson Text, serif')
+    .attr('font-size', d => d.size)
+    .attr('fill', '#5a8a96')
+    .attr('opacity', 0.5)
+    .attr('font-style', 'italic')
+    .attr('text-anchor', 'middle');
+
+  // Route layer
+  const routeLayer = g.append('g').attr('class', 'routes');
+
+  // Draw all routes (visible by default)
+  stories.forEach(story => {
+    story.routes.forEach(([fromId, toId]) => {
+      const from = places[fromId];
+      const to = places[toId];
+      if (!from || !to) return;
+
+      const p1 = projection([from.lon, from.lat]);
+      const p2 = projection([to.lon, to.lat]);
+      const midX = (p1[0] + p2[0]) / 2;
+      const midY = (p1[1] + p2[1]) / 2;
+      // Curve offset
+      const dx = p2[0] - p1[0];
+      const dy = p2[1] - p1[1];
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const offset = dist * 0.15;
+      const cx = midX - (dy / dist) * offset;
+      const cy = midY + (dx / dist) * offset;
+
+      const isDisrupted = story.disrupted;
+
+      routeLayer.append('path')
+        .attr('class', `route route-${story.id}${isDisrupted ? ' disrupted' : ''}`)
+        .attr('d', `M${p1[0]},${p1[1]} Q${cx},${cy} ${p2[0]},${p2[1]}`)
+        .attr('stroke', story.color)
+        .attr('stroke-width', 2.5);
+    });
+  });
+
+  // Place markers
+  const markerLayer = g.append('g').attr('class', 'markers');
+
+  // Determine colors per place (use first story that references it)
+  const placeColors = {};
+  Object.keys(places).forEach(pid => {
+    if (!usedPlaces.has(pid)) return;
+    const story = stories.find(s =>
+      s.locations.includes(pid) || s.routes.some(r => r.includes(pid))
+    );
+    placeColors[pid] = story ? story.color : '#8b6914';
+  });
+
+  // Determine which places have stories located there (for bigger markers)
+  const storyPlaces = new Set();
+  stories.forEach(s => s.locations.forEach(l => storyPlaces.add(l)));
+
+  const placeData = Object.entries(places)
+    .filter(([id]) => usedPlaces.has(id))
+    .map(([id, p]) => ({ id, ...p, pos: projection([p.lon, p.lat]) }));
+
+  // Pulse rings for story locations
+  markerLayer.selectAll('.pulse')
+    .data(placeData.filter(p => storyPlaces.has(p.id)))
+    .join('circle')
+    .attr('class', 'marker-pulse')
+    .attr('cx', d => d.pos[0])
+    .attr('cy', d => d.pos[1])
+    .attr('r', 8)
+    .attr('fill', d => placeColors[d.id])
+    .attr('opacity', 0.4)
+    .style('animation-delay', (d, i) => `${i * 0.3}s`);
+
+  // Main dots
+  markerLayer.selectAll('.dot')
+    .data(placeData)
+    .join('circle')
+    .attr('class', d => `dot dot-${d.id}`)
+    .attr('cx', d => d.pos[0])
+    .attr('cy', d => d.pos[1])
+    .attr('r', d => storyPlaces.has(d.id) ? 5 : 3.5)
+    .attr('fill', d => placeColors[d.id])
+    .attr('stroke', '#2c1810')
+    .attr('stroke-width', 1.5)
+    .attr('cursor', 'pointer')
+    .on('mouseover', function(event, d) {
+      const relatedStories = stories.filter(s =>
+        s.locations.includes(d.id) || s.routes.some(r => r.includes(d.id))
+      );
+      if (relatedStories.length === 0) return;
+
+      const tooltip = d3.select('#tooltip');
+      const names = relatedStories.map(s => `<strong>${s.name}</strong> (${s.ref})`).join('<br>');
+      tooltip.html(`<h4>${d.name}</h4><p>${names}</p>`)
+        .style('opacity', 1)
+        .style('left', (event.pageX + 12) + 'px')
+        .style('top', (event.pageY - 10) + 'px');
+
+      d3.select(this).transition().duration(200).attr('r', storyPlaces.has(d.id) ? 8 : 6);
+    })
+    .on('mouseout', function(event, d) {
+      d3.select('#tooltip').style('opacity', 0);
+      d3.select(this).transition().duration(200).attr('r', storyPlaces.has(d.id) ? 5 : 3.5);
+    });
+
+  // Place labels
+  markerLayer.selectAll('.place-label')
+    .data(placeData)
+    .join('text')
+    .attr('class', 'place-label')
+    .attr('x', d => d.pos[0] + 8)
+    .attr('y', d => d.pos[1] + 3)
+    .text(d => d.name)
+    .attr('font-size', d => storyPlaces.has(d.id) ? 11 : 9)
+    .attr('font-weight', d => storyPlaces.has(d.id) ? 600 : 400);
+
+  // Build legend
+  const legend = d3.select('#legend');
+  legend.append('h3').text('Stories');
+
+  let activeStory = null;
+
+  stories.forEach(story => {
+    const item = legend.append('div')
+      .attr('class', 'legend-item')
+      .attr('data-story', story.id)
+      .on('click', function() {
+        const wasActive = activeStory === story.id;
+        // Clear all highlights
+        legend.selectAll('.legend-item').classed('active', false);
+        svg.selectAll('.route').classed('highlighted', false).classed('dimmed', false);
+
+        if (wasActive) {
+          activeStory = null;
+          // Restore all routes to default
+        } else {
+          activeStory = story.id;
+          d3.select(this).classed('active', true);
+          // Dim all, highlight selected
+          svg.selectAll('.route').classed('dimmed', true);
+          svg.selectAll(`.route-${story.id}`)
+            .classed('dimmed', false)
+            .classed('highlighted', true);
+        }
+      })
+      .on('mouseover', function() {
+        const tooltip = d3.select('#tooltip');
+        tooltip.html(`<h4>${story.name}</h4><p>${story.detail}</p><div class="ref">${story.ref}</div>`)
+          .style('opacity', 1);
+
+        // Position tooltip near legend
+        const rect = this.getBoundingClientRect();
+        tooltip
+          .style('left', (rect.right + 10) + 'px')
+          .style('top', rect.top + 'px');
+
+        // Highlight markers
+        story.locations.forEach(loc => {
+          svg.select(`.dot-${loc}`).transition().duration(200).attr('r', 8);
+        });
+      })
+      .on('mouseout', function() {
+        d3.select('#tooltip').style('opacity', 0);
+        story.locations.forEach(loc => {
+          svg.select(`.dot-${loc}`).transition().duration(200).attr('r', storyPlaces.has(loc) ? 5 : 3.5);
+        });
+      });
+
+    item.append('div')
+      .attr('class', 'legend-dot')
+      .style('background', story.color);
+
+    const textDiv = item.append('div').attr('class', 'legend-text');
+    textDiv.append('strong').text(story.name);
+    textDiv.append('span').attr('class', 'desc').text(story.desc);
+  });
+
+  // Zoom behavior
+  const zoom = d3.zoom()
+    .scaleExtent([0.5, 8])
+    .on('zoom', (event) => {
+      g.attr('transform', event.transform);
+    });
+
+  svg.call(zoom);
+
+}).catch(err => {
+  console.error('Failed to load map data:', err);
+  svg.append('text')
+    .attr('x', width / 2)
+    .attr('y', height / 2)
+    .attr('text-anchor', 'middle')
+    .attr('fill', '#8b6914')
+    .attr('font-size', 18)
+    .text('Failed to load map. Check internet connection and try again.');
+});
+</script>
+</body>
+</html>
