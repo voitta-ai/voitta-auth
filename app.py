@@ -12,7 +12,6 @@ import secrets
 import subprocess
 import threading
 import traceback
-import weakref
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -28,6 +27,7 @@ from fastmcp import FastMCP as FastMCPServer
 from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient, ProxyProvider, ProxyTool
 from fastmcp.client.transports import StreamableHttpTransport
 import mcp.types
+from config import load_config, save_config, migrate_from_legacy, apps_for_backend, CONFIG_PATH
 
 # Surface FastMCP proxy errors (otherwise silently swallowed at DEBUG)
 logging.getLogger("fastmcp.server.providers.aggregate").setLevel(logging.DEBUG)
@@ -180,6 +180,7 @@ class ResilientFastMCPProxy(FastMCPProxy):
         self.add_provider(provider)
 
 
+import objc
 from AppKit import (
     NSAttributedString, NSBezierPath, NSColor, NSFont, NSFontAttributeName,
     NSForegroundColorAttributeName, NSImage, NSMutableAttributedString,
@@ -189,98 +190,15 @@ from Foundation import NSObject, NSTimer, NSRunLoop
 
 load_dotenv()
 
-# ── Provider registry ────────────────────────────────────────────────────────
+# ── OAuth scope mappings ─────────────────────────────────────────────────────
 
-PROVIDERS = {
+OAUTH_SCOPES = {
     "microsoft": {
-        "label": "Microsoft",
-        "settings_fields": [
-            ("ms_tenant_id", "Tenant ID:"),
-            ("ms_client_id", "Client ID:"),
-        ],
-        "env_defaults": {
-            "ms_tenant_id": "AZURE_TENANT_ID",
-            "ms_client_id": "AZURE_CLIENT_ID",
-        },
+        "rag": ["User.Read"],
     },
     "google": {
-        "label": "Google",
-        "settings_fields": [
-            ("google_client_id", "Client ID:"),
-            ("google_client_secret", "Client Secret:"),
-        ],
-        "env_defaults": {
-            "google_client_id": "GOOGLE_CLIENT_ID",
-            "google_client_secret": "GOOGLE_CLIENT_SECRET",
-        },
-    },
-    "okta": {
-        "label": "Okta",
-        "settings_fields": [
-            ("okta_domain", "Domain:"),
-            ("okta_client_id", "Client ID:"),
-        ],
-        "env_defaults": {
-            "okta_domain": "OKTA_DOMAIN",
-            "okta_client_id": "OKTA_CLIENT_ID",
-        },
-    },
-}
-
-PROVIDER_ORDER = ("microsoft", "google", "okta")
-PROVIDER_LETTERS = {"microsoft": "M", "google": "G", "okta": "O"}
-
-# ── Jira (credential-based, non-OAuth) ──────────────────────────────────────
-
-JIRA_SETTINGS_FIELDS = [
-    ("jira_url", "Jira URL:"),
-    ("jira_email", "Email:"),
-    ("jira_api_token", "API Token:"),
-    ("jira_project", "Project:"),
-]
-JIRA_ENV_DEFAULTS = {
-    "jira_url": "JIRA_URL",
-    "jira_email": "JIRA_EMAIL",
-    "jira_api_token": "JIRA_API_TOKEN",
-    "jira_project": "JIRA_PROJECT",
-}
-
-# ── Edit provider registry ──────────────────────────────────────────────────
-
-EDIT_PROVIDERS = {
-    "microsoft_edit": {
-        "label": "Microsoft Edit",
-        "letter": "M",
-        "settings_fields": [
-            ("ms_edit_tenant_id", "Tenant ID:"),
-            ("ms_edit_client_id", "Client ID:"),
-        ],
-        "settings_defaults_from": {
-            "ms_edit_tenant_id": "ms_tenant_id",
-            "ms_edit_client_id": "ms_client_id",
-        },
-        "env_defaults": {
-            "ms_edit_tenant_id": "AZURE_TENANT_ID",
-            "ms_edit_client_id": "AZURE_CLIENT_ID",
-        },
-        "scopes": ["User.Read", "Files.ReadWrite.All", "Sites.ReadWrite.All"],
-    },
-    "google_edit": {
-        "label": "Google Edit",
-        "letter": "G",
-        "settings_fields": [
-            ("google_edit_client_id", "Client ID:"),
-            ("google_edit_client_secret", "Client Secret:"),
-        ],
-        "settings_defaults_from": {
-            "google_edit_client_id": "google_client_id",
-            "google_edit_client_secret": "google_client_secret",
-        },
-        "env_defaults": {
-            "google_edit_client_id": "GOOGLE_CLIENT_ID",
-            "google_edit_client_secret": "GOOGLE_CLIENT_SECRET",
-        },
-        "scopes": (
+        "rag": "openid email profile",
+        "google_workspace": (
             "openid email profile"
             " https://www.googleapis.com/auth/spreadsheets"
             " https://www.googleapis.com/auth/documents"
@@ -290,16 +208,23 @@ EDIT_PROVIDERS = {
     },
 }
 
-EDIT_PROVIDER_ORDER = ("microsoft_edit", "google_edit")
+
+def _scopes_for_app(app, backend):
+    """Compute OAuth scopes for one specific backend (not a union)."""
+    app_type = app["type"]
+    if app_type == "microsoft":
+        return list(OAUTH_SCOPES["microsoft"].get(backend, ["User.Read"]))
+    else:  # google
+        scope_str = OAUTH_SCOPES["google"].get(backend, "openid email profile")
+        return scope_str
+
 
 # ── Global config ────────────────────────────────────────────────────────────
 
 REDIRECT_PORT = int(os.environ.get("REDIRECT_PORT", "53214"))
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
-PROXY_PORT = int(os.environ.get("PROXY_PORT", "18765"))
+GOOGLE_MCP_PORT = int(os.environ.get("GOOGLE_MCP_PORT", "18766"))
 JIRA_MCP_PORT = int(os.environ.get("JIRA_MCP_PORT", "18767"))
-VOITTA_RAG_URL = os.environ.get("VOITTA_RAG_URL", "https://rag.voitta.ai")
-EDIT_PROXY_URL = os.environ.get("EDIT_PROXY_URL", "http://localhost:8000")
 EDIT_MCP_ENV_PATH = os.environ.get("EDIT_MCP_ENV_PATH", os.path.expanduser("~/DEVEL/google_workspace_mcp/.env"))
 JIRA_MCP_ENV_PATH = os.environ.get("JIRA_MCP_ENV_PATH", os.path.expanduser("~/DEVEL/mcp-atlassian/.env"))
 GOOGLE_MCP_DIR = os.environ.get("GOOGLE_MCP_DIR", os.path.expanduser("~/DEVEL/google_workspace_mcp"))
@@ -370,34 +295,6 @@ def _fetch_jira_projects(base_url, email, token):
             break
     projects.sort()
     return projects
-
-
-class _JiraFetchHelper(NSObject):
-    """Button action handler for fetching Jira projects inside the settings dialog."""
-
-    def doFetch_(self, sender):
-        url = self._url_field.stringValue().strip()
-        email = self._email_field.stringValue().strip()
-        token = self._token_field.stringValue().strip()
-        if not (url and email and token):
-            self._popup.removeAllItems()
-            self._popup.addItemWithTitle_("(enter URL, email, and token first)")
-            return
-
-        server_url, parsed_project = _parse_jira_url(url)
-        default_proj = self._default_project or parsed_project
-        projects = _fetch_jira_projects(server_url, email, token)
-
-        self._popup.removeAllItems()
-        if not projects:
-            self._popup.addItemWithTitle_("(no projects found — check credentials)")
-        else:
-            selected_idx = 0
-            for i, (key, name) in enumerate(projects):
-                self._popup.addItemWithTitle_(f"{key} — {name}")
-                if key == default_proj:
-                    selected_idx = i
-            self._popup.selectItemAtIndex_(selected_idx)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -512,107 +409,218 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
 
 class VoittaAuthApp(rumps.App):
     def __init__(self):
-        super().__init__("Voitta", title="M G O J")
+        super().__init__("Voitta", title="V")
 
         self._auth_lock = threading.Lock()
-        self._auth = {}
-        for key in PROVIDER_ORDER:
-            self._auth[key] = {
-                "token": None,
-                "refresh_token": None,
-                "profile": None,
-                "refresh_timer": None,
-                "msal_app": None,
-            }
-        for key in EDIT_PROVIDER_ORDER:
-            self._auth[key] = {
-                "token": None,
-                "refresh_token": None,
-                "profile": None,
-                "refresh_timer": None,
-                "msal_app": None,
-            }
+        self._auth = {}  # keyed by (app_id, backend)
 
-        # Load persistent settings
-        self._settings = self._load_settings()
-        self.voitta_rag_url = self._settings.get("voitta_rag_url", VOITTA_RAG_URL)
-        self.edit_proxy_url = self._settings.get("edit_proxy_url", EDIT_PROXY_URL)
-        self.edit_mcp_env_path = self._settings.get("edit_mcp_env_path", EDIT_MCP_ENV_PATH)
-        self.jira_mcp_env_path = self._settings.get("jira_mcp_env_path", JIRA_MCP_ENV_PATH)
+        # Load config from apps.json (migrate from legacy if needed)
+        self._config = self._load_or_migrate_config()
 
-        # Load per-provider credentials from settings (fall back to env vars)
-        for key, cfg in PROVIDERS.items():
-            for settings_key, env_var in cfg["env_defaults"].items():
-                if settings_key not in self._settings:
-                    self._settings[settings_key] = os.environ.get(env_var, "")
+        # Proxy / path settings
+        proxy = self._config.get("proxy", {})
+        self.voitta_rag_url = proxy.get("rag_url", "https://rag.voitta.ai")
+        self.edit_proxy_url = proxy.get("edit_proxy_url", f"http://localhost:{GOOGLE_MCP_PORT}")
+        self.proxy_port = proxy.get("port", 18765)
+        self.edit_mcp_env_path = EDIT_MCP_ENV_PATH
+        self.jira_mcp_env_path = JIRA_MCP_ENV_PATH
 
-        # Load edit provider credentials (fall back to env vars, then base provider)
-        for key, cfg in EDIT_PROVIDERS.items():
-            for settings_key, env_var in cfg["env_defaults"].items():
-                if settings_key not in self._settings:
-                    env_val = os.environ.get(env_var, "")
-                    base_key = cfg["settings_defaults_from"].get(settings_key, "")
-                    self._settings[settings_key] = env_val or self._settings.get(base_key, "")
+        # Init auth state per (app, backend) pair — each gets independent auth
+        for app in self._config.get("apps", []):
+            for backend in app.get("use_for", []):
+                self._auth[(app["id"], backend)] = {
+                    "token": None,
+                    "refresh_token": None,
+                    "profile": None,
+                    "refresh_timer": None,
+                    "msal_app": None,
+                }
+            if app["type"] == "microsoft":
+                self._rebuild_msal_for_app(app)
 
-        # Load Jira credentials (fall back to env vars)
-        for settings_key, env_var in JIRA_ENV_DEFAULTS.items():
-            if settings_key not in self._settings:
-                self._settings[settings_key] = os.environ.get(env_var, "")
+        # Active app per (backend, type) — determines which token is sent in headers.
+        # {("rag", "google"): "app-uuid", ("google_workspace", "microsoft"): "app-uuid", ...}
+        self._active_app = {}
+        self._init_active_defaults()
 
-        # Initialize MSAL for Microsoft (read + edit)
-        self._rebuild_msal_app()
-        self._rebuild_msal_app_edit()
-
-        # Sync Google Edit credentials to the workspace MCP server's .env
+        # Sync .env files and start subprocesses
         self._sync_edit_mcp_env()
-
-        # Sync Jira credentials to the mcp-atlassian server's .env
         self._sync_jira_mcp_env()
-
-        # Launch MCP server subprocesses (after .env sync)
         self._start_mcp_subprocesses()
 
-        # Build menu with direct references
+        # Build sectioned menu
         self._menu_items = {}
-        menu_list = []
-        for key in PROVIDER_ORDER:
-            label = PROVIDERS[key]["label"]
-            item = rumps.MenuItem(f"Activate {label}", callback=self._make_toggle_callback(key))
-            self._menu_items[key] = item
-            menu_list.append(item)
-        menu_list.append(None)  # separator
-        for key in EDIT_PROVIDER_ORDER:
-            label = EDIT_PROVIDERS[key]["label"]
-            item = rumps.MenuItem(f"Activate {label}", callback=self._make_edit_toggle_callback(key))
-            self._menu_items[key] = item
-            menu_list.append(item)
-        menu_list.append(None)  # separator
-        jira_item = rumps.MenuItem("Jira: Not Configured", callback=self.show_settings)
-        self._menu_items["jira"] = jira_item
-        menu_list.append(jira_item)
-        menu_list.append(None)  # separator
-        menu_list.append(rumps.MenuItem("Settings", callback=self.show_settings))
-        menu_list.append(rumps.MenuItem("Help", callback=self.show_help))
-        self.menu = menu_list
-
-        # Session tracking for tools/list_changed notifications
-        self._mcp_sessions = set()  # set of weakref to ServerSession
-        self._mcp_event_loop = None  # asyncio event loop from the proxy thread
+        self._build_menu()
 
         self._update_menu_state()
 
         # Start unified FastMCP proxy server
         threading.Thread(target=self._run_fastmcp_proxy, daemon=True).start()
 
-    # ── Menu state ───────────────────────────────────────────────────────────
+    # ── Config ────────────────────────────────────────────────────────────────
+
+    def _load_or_migrate_config(self):
+        """Load apps.json, migrating from legacy settings if needed."""
+        if CONFIG_PATH.exists():
+            return load_config()
+        legacy = {}
+        if SETTINGS_PATH.exists():
+            try:
+                legacy = json.loads(SETTINGS_PATH.read_text())
+            except Exception:
+                pass
+        config = migrate_from_legacy(legacy)
+        save_config(config)
+        return config
+
+    def _app_by_id(self, app_id):
+        """Find an app config dict by its ID."""
+        return next((a for a in self._config.get("apps", []) if a["id"] == app_id), None)
+
+    def _init_active_defaults(self):
+        """Set default active app per (backend, type) — first app of each type wins."""
+        for backend in ("rag", "google_workspace"):
+            for app in apps_for_backend(self._config, backend):
+                key = (backend, app["type"])
+                if key not in self._active_app:
+                    self._active_app[key] = app["id"]
+
+    def _set_active(self, backend, app_id):
+        """Set an app as the active one for its (backend, type) pair."""
+        app = self._app_by_id(app_id)
+        if not app:
+            return
+        self._active_app[(backend, app["type"])] = app_id
+        print(f"[voitta-auth] Active {backend}/{app['type']}: {app['name']}")
+        self._update_menu_state()
+
+    def _is_active(self, backend, app_id):
+        """Check if an app is the active one for its (backend, type) pair."""
+        app = self._app_by_id(app_id)
+        if not app:
+            return False
+        return self._active_app.get((backend, app["type"])) == app_id
+
+    # ── Menu ──────────────────────────────────────────────────────────────────
+
+    def _build_menu(self):
+        """Build sectioned menu from config.
+
+        If a backend has multiple apps of the same type, they're grouped into
+        a submenu.  Clicking a submenu item sets it as active (whose token is
+        sent in headers) and triggers auth if not yet authenticated.
+        """
+        menu_list = []
+
+        # MCP Proxy status
+        proxy_item = rumps.MenuItem(f"MCP  http://127.0.0.1:{self.proxy_port}/mcp")
+        proxy_item.set_callback(None)
+        self._menu_items["proxy"] = proxy_item
+        menu_list.append(proxy_item)
+        menu_list.append(None)
+
+        for backend, label in (("rag", "RAG (voitta.ai)"), ("google_workspace", "Google Workspace")):
+            backend_apps = apps_for_backend(self._config, backend)
+            # Microsoft apps cannot be used with Google Workspace
+            if backend == "google_workspace":
+                backend_apps = [a for a in backend_apps if a["type"] != "microsoft"]
+            if not backend_apps:
+                continue
+            header = rumps.MenuItem(label)
+            header.set_callback(None)
+            menu_list.append(header)
+
+            # Group apps by type
+            by_type = {}
+            for app in backend_apps:
+                by_type.setdefault(app["type"], []).append(app)
+
+            for app_type, apps_of_type in by_type.items():
+                if len(apps_of_type) == 1:
+                    # Single app of this type — flat menu item
+                    app = apps_of_type[0]
+                    item = rumps.MenuItem("", callback=self._make_app_toggle(app["id"], backend))
+                    self._menu_items[f"{backend}:{app['id']}"] = item
+                    menu_list.append(item)
+                else:
+                    # Multiple apps of same type — submenu
+                    type_label = "Microsoft" if app_type == "microsoft" else "Google"
+                    parent = rumps.MenuItem(type_label)
+                    for app in apps_of_type:
+                        sub_item = rumps.MenuItem(
+                            "", callback=self._make_app_activate(backend, app["id"])
+                        )
+                        self._menu_items[f"{backend}:{app['id']}"] = sub_item
+                        parent.add(sub_item)
+                    menu_list.append(parent)
+                    self._menu_items[f"{backend}:{app_type}:parent"] = parent
+
+            menu_list.append(None)
+
+        # Jira section
+        header = rumps.MenuItem("Jira")
+        header.set_callback(None)
+        menu_list.append(header)
+        jira_item = rumps.MenuItem("")
+        jira_item.set_callback(None)
+        self._menu_items["jira"] = jira_item
+        menu_list.append(jira_item)
+        menu_list.append(None)
+
+        # Bottom bar
+        menu_list.append(rumps.MenuItem("Settings", callback=self.show_settings))
+        menu_list.append(rumps.MenuItem("Help", callback=self.show_help))
+
+        self.menu = menu_list
+
+    def _rebuild_menu(self):
+        """Clear and rebuild the menu (e.g. after settings change)."""
+        self._menu_items = {}
+        self.menu.clear()
+        self._build_menu()
+
+    def _app_menu_title(self, app, backend, is_submenu=False):
+        """Build menu item title for an app: ●/○  Name  email/Not connected.
+
+        If is_submenu is True and this app is the active+connected one,
+        a checkmark is prepended.
+        """
+        state = self._auth.get((app["id"], backend), {})
+        connected = state.get("token") is not None
+        dot = "\u25CF" if connected else "\u25CB"  # ● / ○
+        profile = state.get("profile") or {}
+        right = profile.get("email", "") if connected else "Not connected"
+        name = app.get("name", app["type"].capitalize())
+        prefix = ""
+        if is_submenu and connected and self._is_active(backend, app["id"]):
+            prefix = "\u2713 "  # ✓
+        return f"{prefix}{dot}  {name:<30} {right}"
+
+    def _jira_menu_title(self):
+        """Build Jira menu item title."""
+        jira = self._config.get("jira", {})
+        if jira.get("server_url") and jira.get("email") and jira.get("api_token"):
+            project = jira.get("project", "")
+            email = jira.get("email", "")
+            dot = "\u25CF"
+            if project:
+                return f"{dot}  Jira Cloud                  {project} ({email})"
+            return f"{dot}  Jira Cloud                  {email}"
+        return "\u25CB  Jira Cloud                  Not configured"
 
     def _build_title(self):
-        parts = [PROVIDER_LETTERS[k] for k in PROVIDER_ORDER]
-        parts.append("J")
-        return " ".join(parts)
+        """Build plain-text fallback title."""
+        seen = []
+        for app in self._config.get("apps", []):
+            letter = "M" if app["type"] == "microsoft" else "G"
+            if letter not in seen:
+                seen.append(letter)
+        if self._has_jira_credentials():
+            seen.append("J")
+        return " ".join(seen) if seen else "V"
 
     def _apply_attributed_title(self):
-        """Set menu bar title with dimmed/bright letters + circled edit indicators."""
+        """Set menu bar title with dimmed/bright letters based on auth state."""
         try:
             button = self._nsapp.nsstatusitem.button()
         except AttributeError:
@@ -622,66 +630,43 @@ class VoittaAuthApp(rumps.App):
         font = NSFont.menuBarFontOfSize_(0)
         title = NSMutableAttributedString.alloc().init()
 
-        # RAG provider letters (M G O)
-        for i, key in enumerate(PROVIDER_ORDER):
+        # App type letters (M, G) — bright if any app of that type is authenticated
+        seen_types = []
+        for app in self._config.get("apps", []):
+            t = app["type"]
+            if t not in seen_types:
+                seen_types.append(t)
+
+        for i, app_type in enumerate(seen_types):
             if i > 0:
                 space = NSAttributedString.alloc().initWithString_attributes_(
                     " ", {NSFontAttributeName: font}
                 )
                 title.appendAttributedString_(space)
-            active = self._auth[key]["token"] is not None
+            letter = "M" if app_type == "microsoft" else "G"
+            active = any(
+                state.get("token") is not None
+                for key, state in self._auth.items()
+                if self._app_by_id(key[0]) and self._app_by_id(key[0])["type"] == app_type
+            )
             alpha = 1.0 if active else 0.4
             color = NSColor.colorWithCalibratedWhite_alpha_(base, alpha)
-            attrs = {
-                NSForegroundColorAttributeName: color,
-                NSFontAttributeName: font,
-            }
-            char = NSAttributedString.alloc().initWithString_attributes_(
-                PROVIDER_LETTERS[key], attrs
-            )
+            attrs = {NSForegroundColorAttributeName: color, NSFontAttributeName: font}
+            char = NSAttributedString.alloc().initWithString_attributes_(letter, attrs)
             title.appendAttributedString_(char)
 
-        # Jira letter (J) — bright if credentials configured, dim otherwise
-        space = NSAttributedString.alloc().initWithString_attributes_(
-            " ", {NSFontAttributeName: font}
-        )
-        title.appendAttributedString_(space)
+        # Jira letter
+        if title.length() > 0:
+            space = NSAttributedString.alloc().initWithString_attributes_(
+                " ", {NSFontAttributeName: font}
+            )
+            title.appendAttributedString_(space)
         jira_active = self._has_jira_credentials()
         alpha = 1.0 if jira_active else 0.4
         color = NSColor.colorWithCalibratedWhite_alpha_(base, alpha)
-        attrs = {
-            NSForegroundColorAttributeName: color,
-            NSFontAttributeName: font,
-        }
+        attrs = {NSForegroundColorAttributeName: color, NSFontAttributeName: font}
         j_char = NSAttributedString.alloc().initWithString_attributes_("J", attrs)
         title.appendAttributedString_(j_char)
-
-        # Edit provider circled letters
-        any_edit = any(self._has_edit_credentials(k) for k in EDIT_PROVIDER_ORDER)
-        if any_edit:
-            space = NSAttributedString.alloc().initWithString_attributes_(
-                "  ", {NSFontAttributeName: font}
-            )
-            title.appendAttributedString_(space)
-
-            icon_size = font.pointSize() + 2
-            for j, key in enumerate(EDIT_PROVIDER_ORDER):
-                if not self._has_edit_credentials(key):
-                    continue
-                if j > 0:
-                    sp = NSAttributedString.alloc().initWithString_attributes_(
-                        " ", {NSFontAttributeName: font}
-                    )
-                    title.appendAttributedString_(sp)
-                active = self._auth[key]["token"] is not None
-                alpha = 1.0 if active else 0.4
-                color = NSColor.colorWithCalibratedWhite_alpha_(base, alpha)
-                img = _circled_letter_image(EDIT_PROVIDERS[key]["letter"], icon_size, color)
-                attachment = NSTextAttachment.alloc().init()
-                cell = NSTextAttachmentCell.alloc().initImageCell_(img)
-                attachment.setAttachmentCell_(cell)
-                img_str = NSAttributedString.attributedStringWithAttachment_(attachment)
-                title.appendAttributedString_(img_str)
 
         button.setAttributedTitle_(title)
 
@@ -691,160 +676,111 @@ class VoittaAuthApp(rumps.App):
         self._apply_attributed_title()
         timer.stop()
 
-    def _has_edit_credentials(self, key):
-        """Return True if the edit provider has required credentials configured."""
-        cfg = EDIT_PROVIDERS[key]
-        for settings_key, _ in cfg["settings_fields"]:
-            val = self._settings.get(settings_key, "")
-            if not val:
-                base_key = cfg["settings_defaults_from"].get(settings_key, "")
-                if not self._settings.get(base_key, ""):
-                    return False
-        return True
-
     def _has_jira_credentials(self):
-        """Return True if Jira is fully configured (URL, email, token, and project)."""
-        return (
-            bool(self._settings.get("jira_url", ""))
-            and bool(self._settings.get("jira_email", ""))
-            and bool(self._settings.get("jira_api_token", ""))
-            and bool(self._settings.get("jira_project", ""))
-        )
-
-    def _log_jira_projects(self):
-        """Fetch and log available Jira projects in the background."""
-        server_url = self._settings.get("jira_server_url", "")
-        email = self._settings.get("jira_email", "")
-        token = self._settings.get("jira_api_token", "")
-        if not (server_url and email and token):
-            return
-        projects = _fetch_jira_projects(server_url, email, token)
-        if projects:
-            names = ", ".join(f"{k} ({n})" for k, n in projects)
-            print(f"[jira] Available projects: {names}")
-        else:
-            print("[jira] No projects found or failed to fetch")
+        """Return True if Jira is fully configured."""
+        jira = self._config.get("jira", {})
+        return bool(jira.get("server_url") and jira.get("email")
+                     and jira.get("api_token") and jira.get("project"))
 
     def _update_menu_state(self):
         self.title = self._build_title()
         self._apply_attributed_title()
-        for key in PROVIDER_ORDER:
-            label = PROVIDERS[key]["label"]
-            item = self._menu_items[key]
-            if self._auth[key]["token"]:
-                item.title = f"Deactivate {label}"
-            else:
-                item.title = f"Activate {label}"
-        for key in EDIT_PROVIDER_ORDER:
-            label = EDIT_PROVIDERS[key]["label"]
-            item = self._menu_items[key]
-            if self._auth[key]["token"]:
-                item.title = f"Deactivate {label}"
-            else:
-                item.title = f"Activate {label}"
+
+        # Update app menu items
+        for backend in ("rag", "google_workspace"):
+            backend_apps = apps_for_backend(self._config, backend)
+            # Group by type to detect submenus
+            by_type = {}
+            for app in backend_apps:
+                by_type.setdefault(app["type"], []).append(app)
+
+            for app_type, apps_of_type in by_type.items():
+                is_submenu = len(apps_of_type) > 1
+                for app in apps_of_type:
+                    key = f"{backend}:{app['id']}"
+                    if key in self._menu_items:
+                        self._menu_items[key].title = self._app_menu_title(
+                            app, backend, is_submenu=is_submenu
+                        )
+
+                # Update parent submenu title with active app's status
+                if is_submenu:
+                    parent_key = f"{backend}:{app_type}:parent"
+                    if parent_key in self._menu_items:
+                        active_id = self._active_app.get((backend, app_type))
+                        type_label = "Microsoft" if app_type == "microsoft" else "Google"
+                        if active_id:
+                            state = self._auth.get((active_id, backend), {})
+                            profile = state.get("profile") or {}
+                            email = profile.get("email", "")
+                            if email:
+                                type_label = f"{type_label} ({email})"
+                        self._menu_items[parent_key].title = type_label
+
         # Jira status
         if "jira" in self._menu_items:
-            if self._has_jira_credentials():
-                email = self._settings.get("jira_email", "")
-                project = self._settings.get("jira_project", "")
-                if project:
-                    self._menu_items["jira"].title = f"Jira: {project} ({email})"
-                else:
-                    self._menu_items["jira"].title = f"Jira: {email}"
-            else:
-                self._menu_items["jira"].title = "Jira: Not Configured"
-        # Notify connected MCP clients that the tool list may have changed
-        self._notify_tools_changed()
+            self._menu_items["jira"].title = self._jira_menu_title()
 
-    def _notify_tools_changed(self):
-        """Send notifications/tools/list_changed to all connected MCP sessions."""
-        loop = self._mcp_event_loop
-        if not loop or loop.is_closed():
-            return
-
-        # Clean up dead references and collect live sessions
-        dead = set()
-        sessions = []
-        for ref in self._mcp_sessions:
-            session = ref()
-            if session is None:
-                dead.add(ref)
-            else:
-                sessions.append(session)
-        self._mcp_sessions -= dead
-
-        if not sessions:
-            return
-
-        async def _broadcast():
-            for session in sessions:
-                try:
-                    await session.send_tool_list_changed()
-                except Exception:
-                    pass
-
-        asyncio.run_coroutine_threadsafe(_broadcast(), loop)
-        print(f"[voitta-auth] Sent tools/list_changed to {len(sessions)} session(s)")
-
-    def _make_toggle_callback(self, provider_key):
+    def _make_app_toggle(self, app_id, backend):
+        """Create a callback that toggles auth for an app on a specific backend."""
         def callback(_):
-            if self._auth[provider_key]["token"]:
-                self._deauth_provider(provider_key)
+            state = self._auth.get((app_id, backend), {})
+            if state.get("token"):
+                self._deauth_app(app_id, backend)
             else:
                 threading.Thread(
-                    target=self._do_auth, args=(provider_key,), daemon=True
+                    target=self._do_auth, args=(app_id, backend), daemon=True
                 ).start()
         return callback
 
-    def _make_edit_toggle_callback(self, provider_key):
+    def _make_app_activate(self, backend, app_id):
+        """Create a callback that sets an app as active + triggers auth if needed."""
         def callback(_):
-            if self._auth[provider_key]["token"]:
-                self._deauth_edit_provider(provider_key)
-            else:
+            self._set_active(backend, app_id)
+            state = self._auth.get((app_id, backend), {})
+            if not state.get("token"):
                 threading.Thread(
-                    target=self._do_auth_edit, args=(provider_key,), daemon=True
+                    target=self._do_auth, args=(app_id, backend), daemon=True
                 ).start()
         return callback
 
     # ── MSAL (Microsoft) ─────────────────────────────────────────────────────
 
-    def _rebuild_msal_app(self):
-        tenant_id = self._settings.get("ms_tenant_id", "")
-        client_id = self._settings.get("ms_client_id", "")
-        if tenant_id and client_id:
-            self._auth["microsoft"]["msal_app"] = msal.PublicClientApplication(
-                client_id,
-                authority=f"https://login.microsoftonline.com/{tenant_id}",
-            )
-        else:
-            self._auth["microsoft"]["msal_app"] = None
-
-    def _rebuild_msal_app_edit(self):
-        tenant_id = self._settings.get("ms_edit_tenant_id", "") or self._settings.get("ms_tenant_id", "")
-        client_id = self._settings.get("ms_edit_client_id", "") or self._settings.get("ms_client_id", "")
-        if tenant_id and client_id:
-            self._auth["microsoft_edit"]["msal_app"] = msal.PublicClientApplication(
-                client_id,
-                authority=f"https://login.microsoftonline.com/{tenant_id}",
-            )
-        else:
-            self._auth["microsoft_edit"]["msal_app"] = None
+    def _rebuild_msal_for_app(self, app):
+        """Build or rebuild MSAL app for a Microsoft app config (per-backend)."""
+        tenant_id = app.get("tenant_id", "")
+        client_id = app.get("client_id", "")
+        for backend in app.get("use_for", []):
+            state = self._auth.get((app["id"], backend))
+            if not state:
+                continue
+            if tenant_id and client_id:
+                state["msal_app"] = msal.PublicClientApplication(
+                    client_id,
+                    authority=f"https://login.microsoftonline.com/{tenant_id}",
+                )
+            else:
+                state["msal_app"] = None
 
     # ── Edit MCP .env sync ────────────────────────────────────────────────────
 
     def _sync_edit_mcp_env(self):
-        """Write Google Edit credentials to the workspace MCP server's .env file."""
+        """Write Google Workspace credentials to the workspace MCP server's .env file."""
         env_path = self.edit_mcp_env_path
         if not env_path:
             return
 
-        client_id = (self._settings.get("google_edit_client_id", "")
-                     or self._settings.get("google_client_id", ""))
-        client_secret = (self._settings.get("google_edit_client_secret", "")
-                         or self._settings.get("google_client_secret", ""))
+        # Find first Google app assigned to google_workspace
+        gw_google = [a for a in self._config.get("apps", [])
+                      if a["type"] == "google" and "google_workspace" in a.get("use_for", [])]
+        if not gw_google:
+            print("[voitta-auth] Skipping edit MCP .env sync — no Google Workspace app")
+            return
 
+        app = gw_google[0]
+        client_id = app.get("client_id", "")
+        client_secret = app.get("client_secret", "")
         if not client_id or not client_secret:
-            print("[voitta-auth] Skipping edit MCP .env sync — no Google credentials")
             return
 
         lines = [
@@ -871,24 +807,20 @@ class VoittaAuthApp(rumps.App):
         if not env_path:
             return
 
-        jira_url = self._settings.get("jira_server_url", "")
-        if not jira_url:
-            # Try parsing from jira_url setting
-            raw_url = self._settings.get("jira_url", "")
-            if raw_url:
-                jira_url, _ = _parse_jira_url(raw_url)
-        email = self._settings.get("jira_email", "")
-        token = self._settings.get("jira_api_token", "")
+        jira = self._config.get("jira", {})
+        server_url = jira.get("server_url", "")
+        email = jira.get("email", "")
+        token = jira.get("api_token", "")
 
-        if not jira_url or not email or not token:
+        if not server_url or not email or not token:
             print("[voitta-auth] Skipping Jira MCP .env sync — missing credentials")
             return
 
-        project = self._settings.get("jira_project", "")
+        project = jira.get("project", "")
 
         lines = [
             "# Managed by voitta-auth — do not edit manually",
-            f"JIRA_URL={jira_url}",
+            f"JIRA_URL={server_url}",
             f"JIRA_USERNAME={email}",
             f"JIRA_API_TOKEN={token}",
         ]
@@ -906,21 +838,22 @@ class VoittaAuthApp(rumps.App):
 
     # ── Auth dispatcher ──────────────────────────────────────────────────────
 
-    def _do_auth(self, provider_key):
+    def _do_auth(self, app_id, backend):
+        """Start OAuth flow for an app on a specific backend."""
+        app = self._app_by_id(app_id)
+        if not app:
+            return
         if not self._auth_lock.acquire(blocking=False):
             _notify("Voitta Auth", "Busy", "Another authentication is in progress.")
             return
         try:
-            label = PROVIDERS[provider_key]["label"]
-            print(f"[voitta-auth] Starting {label} OAuth2 flow...")
-            if provider_key == "microsoft":
-                self._do_auth_microsoft()
-            elif provider_key == "google":
-                self._do_auth_google()
-            elif provider_key == "okta":
-                self._do_auth_okta()
+            print(f"[voitta-auth] Starting {app['name']} ({backend}) OAuth2 flow...")
+            if app["type"] == "microsoft":
+                self._do_auth_microsoft(app, backend)
+            elif app["type"] == "google":
+                self._do_auth_google(app, backend)
         except Exception as e:
-            print(f"[voitta-auth] {provider_key} EXCEPTION: {e}")
+            print(f"[voitta-auth] {app['name']} EXCEPTION: {e}")
             traceback.print_exc()
             _notify("Voitta Auth", "Error", str(e))
         finally:
@@ -939,43 +872,42 @@ class VoittaAuthApp(rumps.App):
 
     # ── Microsoft auth ───────────────────────────────────────────────────────
 
-    def _do_auth_microsoft(self):
-        state = self._auth["microsoft"]
+    def _do_auth_microsoft(self, app, backend):
+        state = self._auth[(app["id"], backend)]
         msal_app = state["msal_app"]
         if not msal_app:
-            _notify("Voitta Auth", "Microsoft", "Configure Tenant ID and Client ID in Settings first.")
+            _notify("Voitta Auth", app["name"], "Configure Tenant ID and Client ID in Settings first.")
             return
 
-        auth_url = msal_app.get_authorization_request_url(
-            ["User.Read"], redirect_uri=REDIRECT_URI
-        )
+        scopes = _scopes_for_app(app, backend)
+        auth_url = msal_app.get_authorization_request_url(scopes, redirect_uri=REDIRECT_URI)
         webbrowser.open(auth_url)
         code, error = self._wait_for_callback()
 
         if not code:
-            _notify("Voitta Auth", "Microsoft", error or "No authorization code received.")
+            _notify("Voitta Auth", app["name"], error or "No authorization code received.")
             return
 
-        print("[voitta-auth] Got auth code, exchanging for token...")
+        print(f"[voitta-auth] Got {app['name']} ({backend}) auth code, exchanging for token...")
         result = msal_app.acquire_token_by_authorization_code(
-            code, scopes=["User.Read"], redirect_uri=REDIRECT_URI
+            code, scopes=scopes, redirect_uri=REDIRECT_URI
         )
 
         if "access_token" in result:
             state["token"] = result["access_token"]
-            self._fetch_profile_microsoft()
-            self._schedule_refresh("microsoft", result.get("expires_in", 3600))
+            self._fetch_profile_microsoft(app["id"], backend)
+            self._schedule_refresh(app["id"], backend, result.get("expires_in", 3600))
             name = state["profile"].get("name", "Unknown") if state["profile"] else "Unknown"
-            print(f"[voitta-auth] Microsoft authenticated as {name}")
+            print(f"[voitta-auth] {app['name']} ({backend}) authenticated as {name}")
             self._update_menu_state()
-            _notify("Voitta Auth", "Microsoft", f"Welcome, {name}!")
+            _notify("Voitta Auth", app["name"], f"Welcome, {name}!")
         else:
             error = result.get("error_description", result.get("error", "Unknown error"))
-            print(f"[voitta-auth] Microsoft token exchange failed: {error}")
-            _notify("Voitta Auth", "Microsoft", str(error))
+            print(f"[voitta-auth] {app['name']} token exchange failed: {error}")
+            _notify("Voitta Auth", app["name"], str(error))
 
-    def _fetch_profile_microsoft(self):
-        state = self._auth["microsoft"]
+    def _fetch_profile_microsoft(self, app_id, backend):
+        state = self._auth[(app_id, backend)]
         try:
             resp = requests.get(
                 "https://graph.microsoft.com/v1.0/me",
@@ -993,21 +925,20 @@ class VoittaAuthApp(rumps.App):
 
     # ── Google auth ──────────────────────────────────────────────────────────
 
-    def _do_auth_google(self):
-        client_id = self._settings.get("google_client_id", "")
-        client_secret = self._settings.get("google_client_secret", "")
+    def _do_auth_google(self, app, backend):
+        client_id = app.get("client_id", "")
+        client_secret = app.get("client_secret", "")
         if not client_id or not client_secret:
-            msg = "Configure Client ID and Client Secret in Settings first."
-            print(f"[voitta-auth] Google: {msg} (client_id={'set' if client_id else 'MISSING'}, client_secret={'set' if client_secret else 'MISSING'})")
-            _notify("Voitta Auth", "Google", msg)
+            _notify("Voitta Auth", app["name"], "Configure Client ID and Client Secret in Settings first.")
             return
 
+        scopes = _scopes_for_app(app, backend)
         verifier, challenge = _pkce_pair()
         params = {
             "client_id": client_id,
             "redirect_uri": REDIRECT_URI,
             "response_type": "code",
-            "scope": "openid email profile",
+            "scope": scopes,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
             "access_type": "offline",
@@ -1018,10 +949,10 @@ class VoittaAuthApp(rumps.App):
         code, error = self._wait_for_callback()
 
         if not code:
-            _notify("Voitta Auth", "Google", error or "No authorization code received.")
+            _notify("Voitta Auth", app["name"], error or "No authorization code received.")
             return
 
-        print("[voitta-auth] Got auth code, exchanging for token...")
+        print(f"[voitta-auth] Got {app['name']} ({backend}) auth code, exchanging for token...")
         resp = requests.post("https://oauth2.googleapis.com/token", data={
             "grant_type": "authorization_code",
             "client_id": client_id,
@@ -1032,236 +963,22 @@ class VoittaAuthApp(rumps.App):
         }, timeout=10)
 
         if not resp.ok:
-            _notify("Voitta Auth", "Google", f"Token exchange failed: {resp.text[:200]}")
+            _notify("Voitta Auth", app["name"], f"Token exchange failed: {resp.text[:200]}")
             return
 
         data = resp.json()
-        state = self._auth["google"]
+        state = self._auth[(app["id"], backend)]
         state["token"] = data["access_token"]
         state["refresh_token"] = data.get("refresh_token")
-        self._fetch_profile_google()
-        self._schedule_refresh("google", data.get("expires_in", 3600))
+        self._fetch_profile_google(app["id"], backend)
+        self._schedule_refresh(app["id"], backend, data.get("expires_in", 3600))
         name = state["profile"].get("name", "Unknown") if state["profile"] else "Unknown"
-        print(f"[voitta-auth] Google authenticated as {name}")
+        print(f"[voitta-auth] {app['name']} ({backend}) authenticated as {name}")
         self._update_menu_state()
-        _notify("Voitta Auth", "Google", f"Welcome, {name}!")
+        _notify("Voitta Auth", app["name"], f"Welcome, {name}!")
 
-    def _fetch_profile_google(self):
-        state = self._auth["google"]
-        try:
-            resp = requests.get(
-                "https://www.googleapis.com/oauth2/v3/userinfo",
-                headers={"Authorization": f"Bearer {state['token']}"},
-                timeout=10,
-            )
-            if resp.ok:
-                data = resp.json()
-                state["profile"] = {
-                    "email": data.get("email", ""),
-                    "name": data.get("name", ""),
-                }
-        except Exception:
-            state["profile"] = None
-
-    # ── Okta auth ────────────────────────────────────────────────────────────
-
-    def _do_auth_okta(self):
-        domain = self._settings.get("okta_domain", "")
-        client_id = self._settings.get("okta_client_id", "")
-        if not domain or not client_id:
-            _notify("Voitta Auth", "Okta", "Configure Domain and Client ID in Settings first.")
-            return
-
-        verifier, challenge = _pkce_pair()
-        params = {
-            "client_id": client_id,
-            "redirect_uri": REDIRECT_URI,
-            "response_type": "code",
-            "scope": "openid email profile offline_access",
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-        }
-        auth_url = f"https://{domain}/oauth2/default/v1/authorize?" + urlencode(params)
-        webbrowser.open(auth_url)
-        code, error = self._wait_for_callback()
-
-        if not code:
-            _notify("Voitta Auth", "Okta", error or "No authorization code received.")
-            return
-
-        print("[voitta-auth] Got auth code, exchanging for token...")
-        resp = requests.post(f"https://{domain}/oauth2/default/v1/token", data={
-            "grant_type": "authorization_code",
-            "client_id": client_id,
-            "code": code,
-            "code_verifier": verifier,
-            "redirect_uri": REDIRECT_URI,
-        }, timeout=10)
-
-        if not resp.ok:
-            _notify("Voitta Auth", "Okta", f"Token exchange failed: {resp.text[:200]}")
-            return
-
-        data = resp.json()
-        state = self._auth["okta"]
-        state["token"] = data["access_token"]
-        state["refresh_token"] = data.get("refresh_token")
-        self._fetch_profile_okta()
-        self._schedule_refresh("okta", data.get("expires_in", 3600))
-        name = state["profile"].get("name", "Unknown") if state["profile"] else "Unknown"
-        print(f"[voitta-auth] Okta authenticated as {name}")
-        self._update_menu_state()
-        _notify("Voitta Auth", "Okta", f"Welcome, {name}!")
-
-    def _fetch_profile_okta(self):
-        state = self._auth["okta"]
-        domain = self._settings.get("okta_domain", "")
-        try:
-            resp = requests.get(
-                f"https://{domain}/oauth2/default/v1/userinfo",
-                headers={"Authorization": f"Bearer {state['token']}"},
-                timeout=10,
-            )
-            if resp.ok:
-                data = resp.json()
-                state["profile"] = {
-                    "email": data.get("email", ""),
-                    "name": data.get("name", ""),
-                }
-        except Exception:
-            state["profile"] = None
-
-    # ── Edit auth dispatcher ────────────────────────────────────────────────
-
-    def _do_auth_edit(self, provider_key):
-        if not self._auth_lock.acquire(blocking=False):
-            _notify("Voitta Auth", "Busy", "Another authentication is in progress.")
-            return
-        try:
-            label = EDIT_PROVIDERS[provider_key]["label"]
-            print(f"[voitta-auth] Starting {label} OAuth2 flow...")
-            if provider_key == "microsoft_edit":
-                self._do_auth_microsoft_edit()
-            elif provider_key == "google_edit":
-                self._do_auth_google_edit()
-        except Exception as e:
-            print(f"[voitta-auth] {provider_key} EXCEPTION: {e}")
-            traceback.print_exc()
-            _notify("Voitta Auth", "Error", str(e))
-        finally:
-            self._auth_lock.release()
-
-    # ── Microsoft Edit auth ─────────────────────────────────────────────────
-
-    def _do_auth_microsoft_edit(self):
-        state = self._auth["microsoft_edit"]
-        msal_app = state["msal_app"]
-        if not msal_app:
-            _notify("Voitta Auth", "Microsoft Edit", "Configure Tenant ID and Client ID in Settings first.")
-            return
-
-        scopes = EDIT_PROVIDERS["microsoft_edit"]["scopes"]
-        auth_url = msal_app.get_authorization_request_url(
-            scopes, redirect_uri=REDIRECT_URI
-        )
-        webbrowser.open(auth_url)
-        code, error = self._wait_for_callback()
-
-        if not code:
-            _notify("Voitta Auth", "Microsoft Edit", error or "No authorization code received.")
-            return
-
-        print("[voitta-auth] Got Microsoft Edit auth code, exchanging for token...")
-        result = msal_app.acquire_token_by_authorization_code(
-            code, scopes=scopes, redirect_uri=REDIRECT_URI
-        )
-
-        if "access_token" in result:
-            state["token"] = result["access_token"]
-            self._fetch_profile_microsoft_edit()
-            self._schedule_refresh("microsoft_edit", result.get("expires_in", 3600))
-            name = state["profile"].get("name", "Unknown") if state["profile"] else "Unknown"
-            print(f"[voitta-auth] Microsoft Edit authenticated as {name}")
-            self._update_menu_state()
-            _notify("Voitta Auth", "Microsoft Edit", f"Welcome, {name}!")
-        else:
-            error = result.get("error_description", result.get("error", "Unknown error"))
-            print(f"[voitta-auth] Microsoft Edit token exchange failed: {error}")
-            _notify("Voitta Auth", "Microsoft Edit", str(error))
-
-    def _fetch_profile_microsoft_edit(self):
-        state = self._auth["microsoft_edit"]
-        try:
-            resp = requests.get(
-                "https://graph.microsoft.com/v1.0/me",
-                headers={"Authorization": f"Bearer {state['token']}"},
-                timeout=10,
-            )
-            if resp.ok:
-                data = resp.json()
-                state["profile"] = {
-                    "email": data.get("mail") or data.get("userPrincipalName", ""),
-                    "name": data.get("displayName", ""),
-                }
-        except Exception:
-            state["profile"] = None
-
-    # ── Google Edit auth ────────────────────────────────────────────────────
-
-    def _do_auth_google_edit(self):
-        client_id = self._settings.get("google_edit_client_id", "") or self._settings.get("google_client_id", "")
-        client_secret = self._settings.get("google_edit_client_secret", "") or self._settings.get("google_client_secret", "")
-        if not client_id or not client_secret:
-            _notify("Voitta Auth", "Google Edit", "Configure Client ID and Client Secret in Settings first.")
-            return
-
-        verifier, challenge = _pkce_pair()
-        params = {
-            "client_id": client_id,
-            "redirect_uri": REDIRECT_URI,
-            "response_type": "code",
-            "scope": EDIT_PROVIDERS["google_edit"]["scopes"],
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "access_type": "offline",
-            "prompt": "consent",
-        }
-        auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
-        webbrowser.open(auth_url)
-        code, error = self._wait_for_callback()
-
-        if not code:
-            _notify("Voitta Auth", "Google Edit", error or "No authorization code received.")
-            return
-
-        print("[voitta-auth] Got Google Edit auth code, exchanging for token...")
-        resp = requests.post("https://oauth2.googleapis.com/token", data={
-            "grant_type": "authorization_code",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-            "code_verifier": verifier,
-            "redirect_uri": REDIRECT_URI,
-        }, timeout=10)
-
-        if not resp.ok:
-            _notify("Voitta Auth", "Google Edit", f"Token exchange failed: {resp.text[:200]}")
-            return
-
-        data = resp.json()
-        state = self._auth["google_edit"]
-        state["token"] = data["access_token"]
-        state["refresh_token"] = data.get("refresh_token")
-        self._fetch_profile_google_edit()
-        self._schedule_refresh("google_edit", data.get("expires_in", 3600))
-        name = state["profile"].get("name", "Unknown") if state["profile"] else "Unknown"
-        print(f"[voitta-auth] Google Edit authenticated as {name}")
-        self._update_menu_state()
-        self._sync_edit_mcp_env()
-        _notify("Voitta Auth", "Google Edit", f"Welcome, {name}!")
-
-    def _fetch_profile_google_edit(self):
-        state = self._auth["google_edit"]
+    def _fetch_profile_google(self, app_id, backend):
+        state = self._auth[(app_id, backend)]
         try:
             resp = requests.get(
                 "https://www.googleapis.com/oauth2/v3/userinfo",
@@ -1279,113 +996,86 @@ class VoittaAuthApp(rumps.App):
 
     # ── Token refresh ────────────────────────────────────────────────────────
 
-    def _schedule_refresh(self, provider_key, expires_in):
-        state = self._auth[provider_key]
+    def _schedule_refresh(self, app_id, backend, expires_in):
+        state = self._auth.get((app_id, backend))
+        if not state:
+            return
         if state["refresh_timer"]:
             state["refresh_timer"].cancel()
         refresh_in = max(expires_in - 300, 60)
 
-        if provider_key == "microsoft":
-            timer = threading.Timer(refresh_in, self._do_refresh_microsoft)
-        elif provider_key == "microsoft_edit":
-            timer = threading.Timer(refresh_in, self._do_refresh_microsoft_edit)
-        elif provider_key in ("google", "google_edit"):
-            timer = threading.Timer(refresh_in, self._do_refresh_generic,
-                                    args=(provider_key, "https://oauth2.googleapis.com/token"))
-        elif provider_key == "okta":
-            domain = self._settings.get("okta_domain", "")
-            timer = threading.Timer(refresh_in, self._do_refresh_generic,
-                                    args=("okta", f"https://{domain}/oauth2/default/v1/token"))
+        app = self._app_by_id(app_id)
+        if not app:
+            return
+
+        if app["type"] == "microsoft":
+            timer = threading.Timer(refresh_in, self._do_refresh_microsoft, args=(app_id, backend))
+        elif app["type"] == "google":
+            timer = threading.Timer(refresh_in, self._do_refresh_google, args=(app_id, backend))
         else:
             return
 
         timer.daemon = True
         timer.start()
         state["refresh_timer"] = timer
-        print(f"[voitta-auth] {provider_key} token refresh scheduled in {refresh_in}s")
+        print(f"[voitta-auth] {app['name']} ({backend}) token refresh scheduled in {refresh_in}s")
 
-    def _do_refresh_microsoft(self):
-        state = self._auth["microsoft"]
+    def _do_refresh_microsoft(self, app_id, backend):
+        state = self._auth.get((app_id, backend))
+        if not state:
+            return
         msal_app = state["msal_app"]
         if not msal_app:
+            return
+        app = self._app_by_id(app_id)
+        if not app:
             return
         accounts = msal_app.get_accounts()
         if not accounts:
             return
-        result = msal_app.acquire_token_silent(["User.Read"], account=accounts[0], force_refresh=True)
-        if result and "access_token" in result:
-            state["token"] = result["access_token"]
-            self._schedule_refresh("microsoft", result.get("expires_in", 3600))
-            print("[voitta-auth] Microsoft token refreshed silently")
-        else:
-            print("[voitta-auth] Microsoft silent refresh failed — user must re-authenticate")
-            state["token"] = None
-            state["profile"] = None
-            self._update_menu_state()
-
-    def _do_refresh_microsoft_edit(self):
-        state = self._auth["microsoft_edit"]
-        msal_app = state["msal_app"]
-        if not msal_app:
-            return
-        accounts = msal_app.get_accounts()
-        if not accounts:
-            return
-        scopes = EDIT_PROVIDERS["microsoft_edit"]["scopes"]
+        scopes = _scopes_for_app(app, backend)
         result = msal_app.acquire_token_silent(scopes, account=accounts[0], force_refresh=True)
         if result and "access_token" in result:
             state["token"] = result["access_token"]
-            self._schedule_refresh("microsoft_edit", result.get("expires_in", 3600))
-            print("[voitta-auth] Microsoft Edit token refreshed silently")
+            self._schedule_refresh(app_id, backend, result.get("expires_in", 3600))
+            print(f"[voitta-auth] {app['name']} ({backend}) token refreshed silently")
         else:
-            print("[voitta-auth] Microsoft Edit silent refresh failed — user must re-authenticate")
+            print(f"[voitta-auth] {app['name']} ({backend}) silent refresh failed")
             state["token"] = None
             state["profile"] = None
             self._update_menu_state()
 
-    def _do_refresh_generic(self, provider_key, token_endpoint):
-        state = self._auth[provider_key]
-        if not state["refresh_token"]:
+    def _do_refresh_google(self, app_id, backend):
+        state = self._auth.get((app_id, backend))
+        if not state or not state["refresh_token"]:
             return
-
-        # Determine credentials based on provider
-        if provider_key == "google":
-            client_id = self._settings.get("google_client_id", "")
-            client_secret = self._settings.get("google_client_secret", "")
-        elif provider_key == "google_edit":
-            client_id = self._settings.get("google_edit_client_id", "") or self._settings.get("google_client_id", "")
-            client_secret = self._settings.get("google_edit_client_secret", "") or self._settings.get("google_client_secret", "")
-        elif provider_key == "okta":
-            client_id = self._settings.get("okta_client_id", "")
-            client_secret = None
-        else:
+        app = self._app_by_id(app_id)
+        if not app:
             return
-
+        client_id = app.get("client_id", "")
+        client_secret = app.get("client_secret", "")
         try:
-            post_data = {
+            resp = requests.post("https://oauth2.googleapis.com/token", data={
                 "grant_type": "refresh_token",
                 "client_id": client_id,
+                "client_secret": client_secret,
                 "refresh_token": state["refresh_token"],
-            }
-            if client_secret:
-                post_data["client_secret"] = client_secret
-            resp = requests.post(token_endpoint, data=post_data, timeout=10)
-
+            }, timeout=10)
             if resp.ok:
                 data = resp.json()
                 state["token"] = data["access_token"]
                 if "refresh_token" in data:
                     state["refresh_token"] = data["refresh_token"]
-                self._schedule_refresh(provider_key, data.get("expires_in", 3600))
-                print(f"[voitta-auth] {provider_key} token refreshed silently")
+                self._schedule_refresh(app_id, backend, data.get("expires_in", 3600))
+                print(f"[voitta-auth] {app['name']} ({backend}) token refreshed silently")
             else:
-                print(f"[voitta-auth] {provider_key} silent refresh failed — user must re-authenticate")
+                print(f"[voitta-auth] {app['name']} ({backend}) refresh failed")
                 state["token"] = None
                 state["refresh_token"] = None
                 state["profile"] = None
                 self._update_menu_state()
         except Exception as e:
-            print(f"[voitta-auth] {provider_key} refresh error: {e}")
+            print(f"[voitta-auth] {app['name']} ({backend}) refresh error: {e}")
             state["token"] = None
             state["refresh_token"] = None
             state["profile"] = None
@@ -1393,80 +1083,77 @@ class VoittaAuthApp(rumps.App):
 
     # ── Deauthentication ─────────────────────────────────────────────────────
 
-    def _deauth_provider(self, provider_key):
-        state = self._auth[provider_key]
-        if state["refresh_timer"]:
-            state["refresh_timer"].cancel()
-            state["refresh_timer"] = None
-
-        if provider_key == "microsoft" and state["msal_app"]:
-            for account in state["msal_app"].get_accounts():
-                state["msal_app"].remove_account(account)
-
-        state["token"] = None
-        state["refresh_token"] = None
-        state["profile"] = None
-
-        label = PROVIDERS[provider_key]["label"]
+    def _deauth_app(self, app_id, backend=None):
+        """Sign out an app. If backend is given, only that backend; otherwise all backends."""
+        app = self._app_by_id(app_id)
+        name = app["name"] if app else app_id
+        backends = [backend] if backend else [b for b in (app or {}).get("use_for", [])]
+        for b in backends:
+            state = self._auth.get((app_id, b))
+            if not state:
+                continue
+            if state["refresh_timer"]:
+                state["refresh_timer"].cancel()
+                state["refresh_timer"] = None
+            if state["msal_app"]:
+                for account in state["msal_app"].get_accounts():
+                    state["msal_app"].remove_account(account)
+            state["token"] = None
+            state["refresh_token"] = None
+            state["profile"] = None
+        label = f"{name} ({backend})" if backend else name
         print(f"[voitta-auth] {label} signed out")
-        _notify("Voitta Auth", label, "Signed out.")
-        self._update_menu_state()
-
-    def _deauth_edit_provider(self, provider_key):
-        state = self._auth[provider_key]
-        if state["refresh_timer"]:
-            state["refresh_timer"].cancel()
-            state["refresh_timer"] = None
-
-        if provider_key == "microsoft_edit" and state["msal_app"]:
-            for account in state["msal_app"].get_accounts():
-                state["msal_app"].remove_account(account)
-
-        state["token"] = None
-        state["refresh_token"] = None
-        state["profile"] = None
-
-        label = EDIT_PROVIDERS[provider_key]["label"]
-        print(f"[voitta-auth] {label} signed out")
-        _notify("Voitta Auth", label, "Signed out.")
+        _notify("Voitta Auth", name, "Signed out.")
         self._update_menu_state()
 
     # ── FastMCP Proxy ─────────────────────────────────────────────────────────
 
     def _make_rag_client_factory(self):
-        """Return a factory that creates a ProxyClient with current RAG auth headers."""
-        app = self
+        """Return a factory that creates a ProxyClient with current RAG auth headers.
+
+        For each provider type (Microsoft, Google), only the *active* app's token
+        is sent.  This avoids header collisions when multiple apps of the same type
+        are configured.
+        """
+        app_ref = self
         def factory():
             headers = {}
-            for key in PROVIDER_ORDER:
-                state = app._auth[key]
-                if not state["token"]:
+            for app_type in ("microsoft", "google"):
+                active_id = app_ref._active_app.get(("rag", app_type))
+                if not active_id:
                     continue
-                suffix = PROVIDERS[key]["label"]
+                state = app_ref._auth.get((active_id, "rag"), {})
+                if not state.get("token"):
+                    continue
+                suffix = app_type.capitalize()  # "Microsoft" or "Google"
                 headers[f"X-Auth-Token-{suffix}"] = f"Bearer {state['token']}"
-                if state["profile"]:
-                    headers[f"X-Auth-Email-{suffix}"] = state["profile"].get("email", "")
-                    headers[f"X-Auth-Name-{suffix}"] = state["profile"].get("name", "")
-            url = f"{app.voitta_rag_url.rstrip('/')}/mcp/mcp"
+                profile = state.get("profile") or {}
+                if profile.get("email"):
+                    headers[f"X-Auth-Email-{suffix}"] = profile["email"]
+                if profile.get("name"):
+                    headers[f"X-Auth-Name-{suffix}"] = profile["name"]
+            url = f"{app_ref.voitta_rag_url.rstrip('/')}/mcp/mcp"
             print(f"[voitta-auth] RAG factory: url={url}, {len(headers)} headers")
             transport = StreamableHttpTransport(url=url, headers=headers)
             return ProxyClient(transport)
         return factory
 
     def _make_google_client_factory(self):
-        """Return a factory that creates a ProxyClient with current edit Bearer token."""
-        app = self
+        """Return a factory that creates a ProxyClient with current Google Workspace Bearer token."""
+        app_ref = self
         def factory():
             headers = {}
-            for key in EDIT_PROVIDER_ORDER:
-                state = app._auth[key]
-                if state["token"]:
+            active_id = app_ref._active_app.get(("google_workspace", "google"))
+            if active_id:
+                state = app_ref._auth.get((active_id, "google_workspace"), {})
+                if state.get("token"):
                     headers["Authorization"] = f"Bearer {state['token']}"
-                    if state["profile"]:
-                        headers["X-Auth-Email"] = state["profile"].get("email", "")
-                        headers["X-Auth-Name"] = state["profile"].get("name", "")
-                    break
-            url = f"{app.edit_proxy_url.rstrip('/')}/mcp"
+                    profile = state.get("profile") or {}
+                    if profile.get("email"):
+                        headers["X-Auth-Email"] = profile["email"]
+                    if profile.get("name"):
+                        headers["X-Auth-Name"] = profile["name"]
+            url = f"{app_ref.edit_proxy_url.rstrip('/')}/mcp"
             print(f"[voitta-auth] Google factory: url={url}, headers={list(headers.keys())}")
             transport = StreamableHttpTransport(url=url, headers=headers)
             return ProxyClient(transport)
@@ -1511,60 +1198,11 @@ class VoittaAuthApp(rumps.App):
         )
         main_server.mount(jira_proxy, prefix="jira")
 
-        # Patch LowLevelServer.run to track active sessions for tools/list_changed
-        app_ref = self
-        original_run = main_server._mcp_server.run
-
-        async def tracking_run(read_stream, write_stream, initialization_options, **kwargs):
-            # Capture the event loop on first session
-            app_ref._mcp_event_loop = asyncio.get_running_loop()
-            # Wrap write_stream to intercept session creation
-            # We hook into the original run and track the session via the lifespan
-            from fastmcp.server.low_level import MiddlewareServerSession
-            from contextlib import AsyncExitStack
-            import anyio
-
-            async with AsyncExitStack() as stack:
-                lifespan_context = await stack.enter_async_context(
-                    main_server._mcp_server.lifespan(main_server._mcp_server)
-                )
-                session = await stack.enter_async_context(
-                    MiddlewareServerSession(
-                        main_server._mcp_server.fastmcp,
-                        read_stream,
-                        write_stream,
-                        initialization_options,
-                        stateless=kwargs.get("stateless", False),
-                    )
-                )
-
-                # Track this session
-                ref = weakref.ref(session)
-                app_ref._mcp_sessions.add(ref)
-                print(f"[voitta-auth] MCP session connected (total: {len(app_ref._mcp_sessions)})")
-
-                try:
-                    async with anyio.create_task_group() as tg:
-                        session._subscription_task_group = tg
-                        async for message in session.incoming_messages:
-                            tg.start_soon(
-                                main_server._mcp_server._handle_message,
-                                message,
-                                session,
-                                lifespan_context,
-                                kwargs.get("raise_exceptions", False),
-                            )
-                finally:
-                    app_ref._mcp_sessions.discard(ref)
-                    print(f"[voitta-auth] MCP session disconnected (total: {len(app_ref._mcp_sessions)})")
-
-        main_server._mcp_server.run = tracking_run
-
-        print(f"[voitta-auth] FastMCP proxy on http://127.0.0.1:{PROXY_PORT}/mcp")
+        print(f"[voitta-auth] FastMCP proxy on http://127.0.0.1:{self.proxy_port}/mcp")
         print(f"[voitta-auth]   RAG → {self.voitta_rag_url}")
         print(f"[voitta-auth]   Google → {self.edit_proxy_url}")
         print(f"[voitta-auth]   Jira → http://localhost:{JIRA_MCP_PORT}/mcp")
-        main_server.run(transport="streamable-http", host="127.0.0.1", port=PROXY_PORT)
+        main_server.run(transport="streamable-http", host="127.0.0.1", port=self.proxy_port)
 
     # ── MCP subprocess management ────────────────────────────────────────────
 
@@ -1576,7 +1214,7 @@ class VoittaAuthApp(rumps.App):
         if Path(GOOGLE_MCP_DIR).is_dir():
             try:
                 proc = subprocess.Popen(
-                    ["uv", "run", "main.py", "--transport", "streamable-http"],
+                    ["uv", "run", "main.py", "--transport", "streamable-http", "--port", str(GOOGLE_MCP_PORT)],
                     cwd=GOOGLE_MCP_DIR,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -1623,260 +1261,101 @@ class VoittaAuthApp(rumps.App):
                 except subprocess.TimeoutExpired:
                     proc.kill()
 
-    # ── Settings ─────────────────────────────────────────────────────────────
-
-    def _load_settings(self):
-        if SETTINGS_PATH.exists():
-            try:
-                with open(SETTINGS_PATH) as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {}
-
-    def _save_settings(self):
-        data = {
-            "voitta_rag_url": self.voitta_rag_url,
-            "edit_proxy_url": self.edit_proxy_url,
-            "edit_mcp_env_path": self.edit_mcp_env_path,
-            "jira_mcp_env_path": self.jira_mcp_env_path,
-        }
-        for cfg in PROVIDERS.values():
-            for settings_key, _ in cfg["settings_fields"]:
-                data[settings_key] = self._settings.get(settings_key, "")
-        for cfg in EDIT_PROVIDERS.values():
-            for settings_key, _ in cfg["settings_fields"]:
-                data[settings_key] = self._settings.get(settings_key, "")
-        for settings_key, _ in JIRA_SETTINGS_FIELDS:
-            data[settings_key] = self._settings.get(settings_key, "")
-        # Also persist derived Jira server URL
-        if self._settings.get("jira_server_url"):
-            data["jira_server_url"] = self._settings["jira_server_url"]
-        with open(SETTINGS_PATH, "w") as f:
-            json.dump(data, f, indent=2)
-        print("[voitta-auth] Settings saved")
+    # ── Settings (WKWebView) ─────────────────────────────────────────────────
 
     def show_settings(self, _):
-        from AppKit import (
-            NSApp, NSAlert, NSButton, NSFont,
-            NSPopUpButton, NSTextField, NSView,
-        )
+        """Open settings in a native WKWebView window."""
+        from AppKit import NSApp, NSBackingStoreBuffered, NSFloatingWindowLevel, NSWindow
         from Foundation import NSMakeRect
+        from WebKit import WKWebView
 
-        label_w, field_w, row_h, header_h, gap = 140, 512, 22, 20, 8
-        total_w = label_w + field_w
-
-        # Build row descriptors: (label, value_or_None, settings_key_or_None, is_header)
-        rows = [("Voitta RAG URL:", self.voitta_rag_url, "voitta_rag_url", False)]
-        for key in PROVIDER_ORDER:
-            cfg = PROVIDERS[key]
-            rows.append((f"── {cfg['label']} ──", None, None, True))
-            for settings_key, field_label in cfg["settings_fields"]:
-                rows.append((field_label, self._settings.get(settings_key, ""), settings_key, False))
-
-        rows.append(("Edit Proxy URL:", self.edit_proxy_url, "edit_proxy_url", False))
-        rows.append(("Edit MCP .env:", self.edit_mcp_env_path, "edit_mcp_env_path", False))
-        for key in EDIT_PROVIDER_ORDER:
-            cfg = EDIT_PROVIDERS[key]
-            rows.append((f"── {cfg['label']} ──", None, None, True))
-            for settings_key, field_label in cfg["settings_fields"]:
-                val = self._settings.get(settings_key, "")
-                if not val:
-                    base_key = cfg["settings_defaults_from"].get(settings_key, "")
-                    val = self._settings.get(base_key, "")
-                rows.append((field_label, val, settings_key, False))
-
-        rows.append(("Jira MCP .env:", self.jira_mcp_env_path, "jira_mcp_env_path", False))
-        rows.append(("── Jira ──", None, None, True))
-        # Jira URL/Email/Token as text fields; Project handled as popup below
-        jira_url_val = self._settings.get("jira_url", "")
-        parsed_project = ""
-        if jira_url_val:
-            _, parsed_project = _parse_jira_url(jira_url_val)
-        for settings_key, field_label in JIRA_SETTINGS_FIELDS:
-            if settings_key == "jira_project":
-                continue  # rendered as popup + fetch button below
-            rows.append((field_label, self._settings.get(settings_key, ""), settings_key, False))
-
-        # Calculate total height (generic rows + 1 extra row for popup+button)
-        total_h = 0
-        for i, (_, _, _, is_header) in enumerate(rows):
-            total_h += header_h if is_header else row_h
-            if i > 0:
-                total_h += gap
-        total_h += row_h + gap  # for "Project: [popup] [Fetch]" row
-
-        container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, total_w, total_h))
-        text_fields = []       # (settings_key, NSTextField)
-        bold_font = NSFont.boldSystemFontOfSize_(11)
-
-        y_cursor = total_h
-        for label_text, value, settings_key, is_header in rows:
-            h = header_h if is_header else row_h
-            y_cursor -= h
-
-            if is_header:
-                lbl = NSTextField.alloc().initWithFrame_(
-                    NSMakeRect(0, y_cursor, total_w, h)
-                )
-                lbl.setStringValue_(label_text)
-                lbl.setBezeled_(False)
-                lbl.setDrawsBackground_(False)
-                lbl.setEditable_(False)
-                lbl.setSelectable_(False)
-                lbl.setFont_(bold_font)
-                lbl.setAlignment_(0)   # NSTextAlignmentLeft
-                container.addSubview_(lbl)
-            else:
-                lbl = NSTextField.alloc().initWithFrame_(
-                    NSMakeRect(0, y_cursor + 1, label_w - 6, row_h)
-                )
-                lbl.setStringValue_(label_text)
-                lbl.setBezeled_(False)
-                lbl.setDrawsBackground_(False)
-                lbl.setEditable_(False)
-                lbl.setSelectable_(False)
-                lbl.setAlignment_(1)   # NSTextAlignmentRight
-                container.addSubview_(lbl)
-
-                fld = NSTextField.alloc().initWithFrame_(
-                    NSMakeRect(label_w, y_cursor, field_w, row_h)
-                )
-                fld.setStringValue_(value or "")
-                container.addSubview_(fld)
-                text_fields.append((settings_key, fld))
-
-            y_cursor -= gap
-
-        # ── Jira project popup + Fetch button ─────────────────────────────
-        y_cursor -= row_h
-        lbl = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(0, y_cursor + 1, label_w - 6, row_h)
+        mask = 1 | 2 | 8  # titled | closable | resizable
+        frame = NSMakeRect(200, 200, 540, 650)
+        window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            frame, mask, NSBackingStoreBuffered, False
         )
-        lbl.setStringValue_("Project:")
-        lbl.setBezeled_(False)
-        lbl.setDrawsBackground_(False)
-        lbl.setEditable_(False)
-        lbl.setSelectable_(False)
-        lbl.setAlignment_(1)
-        container.addSubview_(lbl)
+        window.setTitle_("Voitta Auth \u2014 Settings")
+        window.center()
 
-        popup_w = field_w - 130
-        jira_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(label_w, y_cursor, popup_w, row_h), False
+        webview = WKWebView.alloc().initWithFrame_(window.contentView().bounds())
+        webview.setAutoresizingMask_(18)  # width + height flexible
+        window.contentView().addSubview_(webview)
+
+        # Embed config directly into HTML as inline script
+        html_path = Path(__file__).parent / "ui" / "settings.html"
+        html_content = html_path.read_text(encoding="utf-8")
+        config_json = json.dumps(self._config)
+        html_content = html_content.replace(
+            "/*INJECT_CONFIG*/",
+            f"var _initialConfig = {config_json};",
         )
-        stored_project = self._settings.get("jira_project", "")
-        if stored_project:
-            jira_popup.addItemWithTitle_(stored_project)
-        else:
-            jira_popup.addItemWithTitle_("(click Fetch Projects)")
-        container.addSubview_(jira_popup)
+        webview.loadHTMLString_baseURL_(html_content, None)
 
-        fetch_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect(label_w + popup_w + 8, y_cursor, 122, row_h)
+        # KVO observer on webview.title — JS sets document.title to signal save/cancel
+        observer = _SettingsTitleObserver.alloc().initWithApp_window_(self, window)
+        webview.addObserver_forKeyPath_options_context_(observer, "title", 1, None)
+
+        # Store strong references to prevent GC / segfaults
+        self._settings_refs = (window, webview, observer)
+
+        window.setLevel_(NSFloatingWindowLevel)
+        NSApp.setActivationPolicy_(0)
+        NSApp.activateIgnoringOtherApps_(True)
+        window.makeKeyAndOrderFront_(None)
+
+        # Delayed focus grab (same pattern as _show_modal)
+        trigger = _FocusTrigger.alloc().init()
+        trigger.setWindow_field_(window, None)
+        timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.1, trigger, "focus:", None, False
         )
-        fetch_btn.setTitle_("Fetch Projects")
-        fetch_btn.setBezelStyle_(1)  # NSRoundedBezelStyle
-        container.addSubview_(fetch_btn)
+        NSRunLoop.mainRunLoop().addTimer_forMode_(timer, "NSDefaultRunLoopMode")
 
-        # Wire fetch helper to button
-        jira_tf = {k: f for k, f in text_fields if k.startswith("jira_")}
-        fetch_helper = _JiraFetchHelper.alloc().init()
-        fetch_helper._url_field = jira_tf.get("jira_url")
-        fetch_helper._email_field = jira_tf.get("jira_email")
-        fetch_helper._token_field = jira_tf.get("jira_api_token")
-        fetch_helper._popup = jira_popup
-        fetch_helper._btn = fetch_btn
-        fetch_helper._default_project = parsed_project or stored_project
-        fetch_btn.setTarget_(fetch_helper)
-        fetch_btn.setAction_("doFetch:")
+    def _apply_settings(self, new_config):
+        """Apply a new config dict from the settings page."""
+        old_keys = set(self._auth.keys())
 
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_("Voitta Auth Settings")
-        alert.setInformativeText_("Saved to ~/.voitta_auth_settings.json")
-        alert.addButtonWithTitle_("Save")
-        alert.addButtonWithTitle_("Cancel")
-        alert.setAccessoryView_(container)
+        self._config = new_config
+        save_config(new_config)
 
-        first_fld = text_fields[0][1] if text_fields else None
-        result = _show_modal(alert, first_field=first_fld)
+        # Build new set of (app_id, backend) keys
+        new_keys = set()
+        for app in new_config.get("apps", []):
+            for backend in app.get("use_for", []):
+                new_keys.add((app["id"], backend))
 
-        if result != 1000:
-            return
+        # Init auth state for new (app, backend) pairs
+        for app in new_config.get("apps", []):
+            for backend in app.get("use_for", []):
+                if (app["id"], backend) not in self._auth:
+                    self._auth[(app["id"], backend)] = {
+                        "token": None, "refresh_token": None,
+                        "profile": None, "refresh_timer": None,
+                        "msal_app": None,
+                    }
+            if app["type"] == "microsoft":
+                self._rebuild_msal_for_app(app)
 
-        # Collect new values
-        old_settings = dict(self._settings)
+        # Remove auth for deleted (app, backend) pairs
+        for key in old_keys - new_keys:
+            app_id, backend = key
+            self._deauth_app(app_id, backend)
+            self._auth.pop(key, None)
 
-        for settings_key, fld in text_fields:
-            val = fld.stringValue().strip()
-            if settings_key == "voitta_rag_url":
-                self.voitta_rag_url = val.rstrip("/") or self.voitta_rag_url
-            elif settings_key == "edit_proxy_url":
-                self.edit_proxy_url = val.rstrip("/") or self.edit_proxy_url
-            elif settings_key == "edit_mcp_env_path":
-                self.edit_mcp_env_path = val or self.edit_mcp_env_path
-            elif settings_key == "jira_mcp_env_path":
-                self.jira_mcp_env_path = val or self.jira_mcp_env_path
-            else:
-                self._settings[settings_key] = val
+        # Update proxy settings
+        proxy = new_config.get("proxy", {})
+        self.voitta_rag_url = proxy.get("rag_url", "https://rag.voitta.ai")
+        self.edit_proxy_url = proxy.get("edit_proxy_url", f"http://localhost:{GOOGLE_MCP_PORT}")
 
-        # Collect Jira project from popup
-        selected = jira_popup.titleOfSelectedItem()
-        if selected and not selected.startswith("("):
-            self._settings["jira_project"] = selected.split(" — ")[0].strip()
-        else:
-            self._settings["jira_project"] = ""
+        # Re-init active app defaults (new apps get a default active slot)
+        self._init_active_defaults()
 
-        self._save_settings()
-
-        # Detect per-provider credential changes and clear affected sessions
-        for key, cfg in PROVIDERS.items():
-            changed = False
-            for settings_key, _ in cfg["settings_fields"]:
-                if self._settings.get(settings_key, "") != old_settings.get(settings_key, ""):
-                    changed = True
-                    break
-            if changed:
-                self._deauth_provider(key)
-                if key == "microsoft":
-                    self._rebuild_msal_app()
-                print(f"[voitta-auth] {PROVIDERS[key]['label']} credentials changed — session cleared")
-
-        for key, cfg in EDIT_PROVIDERS.items():
-            changed = False
-            for settings_key, _ in cfg["settings_fields"]:
-                if self._settings.get(settings_key, "") != old_settings.get(settings_key, ""):
-                    changed = True
-                    break
-            if changed:
-                self._deauth_edit_provider(key)
-                if key == "microsoft_edit":
-                    self._rebuild_msal_app_edit()
-                print(f"[voitta-auth] {cfg['label']} credentials changed — session cleared")
-
+        # Sync and rebuild
         self._sync_edit_mcp_env()
-
-        # Detect Jira credential changes
-        jira_changed = any(
-            self._settings.get(k, "") != old_settings.get(k, "")
-            for k, _ in JIRA_SETTINGS_FIELDS
-        )
-        if jira_changed:
-            # Parse URL to extract server URL and default project
-            jira_url = self._settings.get("jira_url", "")
-            if jira_url:
-                server_url, parsed_project = _parse_jira_url(jira_url)
-                self._settings["jira_server_url"] = server_url
-                if not self._settings.get("jira_project", "") and parsed_project:
-                    self._settings["jira_project"] = parsed_project
-                print(f"[voitta-auth] Jira server: {server_url}, project: {self._settings.get('jira_project', '')}")
-            print("[voitta-auth] Jira credentials changed")
-            self._save_settings()
-            self._sync_jira_mcp_env()
-            self._update_menu_state()
-            # Fetch available projects in background
-            if self._has_jira_credentials() and self._settings.get("jira_server_url"):
-                threading.Thread(target=self._log_jira_projects, daemon=True).start()
+        self._sync_jira_mcp_env()
+        self._rebuild_menu()
+        self._update_menu_state()
+        print("[voitta-auth] Settings saved and applied")
 
     # ── Help ─────────────────────────────────────────────────────────────────
 
@@ -1886,21 +1365,89 @@ class VoittaAuthApp(rumps.App):
         alert.setMessageText_("Voitta Auth Help")
         alert.setInformativeText_(
             "Voitta Auth sits in your menu bar.\n\n"
-            "Status: M G O J  (M) (G)\n"
-            "  Bright = authenticated/configured, dimmed = not\n"
-            "  Letters = RAG providers + Jira, circled = Edit providers\n\n"
-            "Activate/Deactivate each provider independently.\n"
-            "Jira: paste a Jira URL to auto-detect server and project.\n"
-            "  Uses email + API token (no browser login).\n\n"
-            f"MCP proxy: http://127.0.0.1:{PROXY_PORT}/mcp (unified)\n"
-            f"  RAG → {self.voitta_rag_url}\n"
-            f"  Google → {self.edit_proxy_url}\n"
-            f"  Jira → http://127.0.0.1:{JIRA_MCP_PORT}/mcp\n"
-            f"Google MCP dir: {GOOGLE_MCP_DIR}\n"
-            f"Jira MCP dir: {JIRA_MCP_DIR}"
+            "Bright letters = authenticated, dimmed = not.\n"
+            "Click an app to connect/disconnect.\n\n"
+            "Manage OAuth applications and Jira credentials\n"
+            "via Settings.\n\n"
+            f"MCP proxy: http://127.0.0.1:{self.proxy_port}/mcp\n"
+            f"  RAG \u2192 {self.voitta_rag_url}\n"
+            f"  Google \u2192 {self.edit_proxy_url}\n"
+            f"  Jira \u2192 http://127.0.0.1:{JIRA_MCP_PORT}/mcp"
         )
         alert.addButtonWithTitle_("OK")
         _show_modal(alert)
+
+
+# ── WKWebView settings bridge (KVO on document.title) ────────────────────────
+
+class _SettingsTitleObserver(NSObject):
+    """KVO observer on WKWebView.title.
+
+    JS signals save/cancel by setting document.title:
+      - "VOITTA_SAVE:<json>"  → apply settings and close
+      - "VOITTA_CANCEL"       → close without saving
+    """
+
+    def initWithApp_window_(self, app_ref, window):
+        self = objc.super(_SettingsTitleObserver, self).init()
+        if self is not None:
+            self._app = app_ref
+            self._window = window
+            self._handled = False
+        return self
+
+    def observeValueForKeyPath_ofObject_change_context_(
+        self, keyPath, obj, change, context
+    ):
+        if self._handled:
+            return
+        title = obj.title()
+        if not title:
+            return
+
+        if title == "VOITTA_SAVE":
+            self._handled = True
+            try:
+                obj.removeObserver_forKeyPath_(self, "title")
+            except Exception:
+                pass
+            # Read full config data via evaluateJavaScript (title truncates)
+            obj.evaluateJavaScript_completionHandler_(
+                "JSON.stringify(collectAll())", self.onSaveData_error_
+            )
+            return
+
+        elif title == "VOITTA_CANCEL":
+            self._handled = True
+            try:
+                obj.removeObserver_forKeyPath_(self, "title")
+            except Exception:
+                pass
+            self._deferClose()
+
+    def onSaveData_error_(self, result, error):
+        """Completion handler for evaluateJavaScript — receives the config JSON."""
+        if error:
+            print(f"[voitta-auth] Settings JS error: {error}")
+        elif result:
+            try:
+                data = json.loads(result)
+                self._app._apply_settings(data)
+            except Exception as e:
+                print(f"[voitta-auth] Settings save error: {e}")
+        self._deferClose()
+
+    def _deferClose(self):
+        """Hide window on next run loop tick. Don't close/dealloc — WKWebView segfaults."""
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.0, self, "doClose:", None, False
+        )
+
+    def doClose_(self, timer):
+        from AppKit import NSApp
+        if self._window:
+            self._window.orderOut_(None)  # hide, don't close (avoids WKWebView dealloc crash)
+        NSApp.setActivationPolicy_(1)  # back to accessory (menu bar only)
 
 
 if __name__ == "__main__":

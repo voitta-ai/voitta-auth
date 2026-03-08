@@ -9,7 +9,7 @@ A macOS menu bar application that authenticates users via multiple identity prov
 3. On activation, opens the provider's login page in the browser and captures the OAuth2 callback
 4. Runs a unified FastMCP proxy (default `http://127.0.0.1:18765/mcp`) that mounts three backends:
    - **voitta_rag** — forwards to [voitta-rag](https://github.com/voitta-ai/voitta-rag), injects per-provider `X-Auth-Token-*` headers
-   - **google_sheets** — forwards to a Google Workspace MCP server, injects `Authorization: Bearer` header
+   - **google_workspace** — forwards to a Google Workspace MCP server, injects `Authorization: Bearer` header
    - **jira** — forwards to mcp-atlassian subprocess (credentials via `.env`)
 5. Edit providers use broader OAuth scopes for document editing (Sheets, Docs, Slides, Drive for Google; Files, Sites for Microsoft)
 6. Jira uses static credentials (email + API token) — no browser login or token refresh needed
@@ -149,7 +149,7 @@ The `voitta_rag` proxy backend injects per-provider headers for every authentica
 
 ### Google Workspace Backend Headers
 
-The `google_sheets` proxy backend injects a single standard `Authorization` header from the first available edit provider:
+The `google_workspace` proxy backend injects a single standard `Authorization` header from the first available edit provider:
 
 | Header | Description |
 |--------|-------------|
@@ -190,7 +190,7 @@ Add the following to your `claude_desktop_config.json` or `.claude/settings.json
 }
 ```
 
-All backends are exposed through this single endpoint. Tools are namespaced with prefixes: `voitta_rag_*`, `google_sheets_*`, `jira_*`.
+All backends are exposed through this single endpoint. Tools are namespaced with prefixes: `voitta_rag_*`, `google_workspace_*`, `jira_*`.
 
 ## License
 
