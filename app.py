@@ -1474,7 +1474,18 @@ class VoittaAuthApp(rumps.App):
 
     def _run_fastmcp_proxy(self):
         """Run unified FastMCP proxy server mounting all backends."""
-        main_server = FastMCPServer("voitta-auth")
+        main_server = FastMCPServer(
+            "voitta-auth",
+            instructions=(
+                "You are connected through Voitta Auth, a unified MCP proxy. "
+                "All tool names are prefixed by backend:\n"
+                "  • voitta_rag_*   — RAG search, memory, file retrieval\n"
+                "  • google_workspace_* — Google Workspace (Gmail, Drive, Sheets, Docs, Calendar)\n"
+                "  • jira_*         — Jira issues, sprints, boards\n"
+                "If a google_workspace_* tool fails with an auth error, "
+                "ask the user to log in via the Voitta Auth menu bar icon."
+            ),
+        )
 
         # RAG proxy with dynamic per-provider auth headers
         rag_proxy = ResilientFastMCPProxy(
@@ -1487,11 +1498,11 @@ class VoittaAuthApp(rumps.App):
         # Google Workspace proxy with dynamic Bearer token
         google_proxy = ResilientFastMCPProxy(
             client_factory=self._make_google_client_factory(),
-            name="google-sheets",
+            name="google-workspace",
             backend_name="Google Workspace",
             cache_listings=True,
         )
-        main_server.mount(google_proxy, prefix="google_sheets")
+        main_server.mount(google_proxy, prefix="google_workspace")
 
         # Jira proxy (credentials already in subprocess .env)
         jira_proxy = FastMCPServer.as_proxy(
