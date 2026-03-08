@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Voitta Auth - macOS menu bar app for multi-provider OAuth2 authentication with MCP proxy."""
 
+import asyncio
 import atexit
 import base64
 import hashlib
@@ -11,6 +12,7 @@ import secrets
 import subprocess
 import threading
 import traceback
+import weakref
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -23,13 +25,161 @@ import msal
 import requests
 import rumps
 from fastmcp import FastMCP as FastMCPServer
-from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient
+from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient, ProxyProvider, ProxyTool
 from fastmcp.client.transports import StreamableHttpTransport
+import mcp.types
 
 # Surface FastMCP proxy errors (otherwise silently swallowed at DEBUG)
 logging.getLogger("fastmcp.server.providers.aggregate").setLevel(logging.DEBUG)
 logging.basicConfig(level=logging.WARNING, format="[%(name)s] %(levelname)s: %(message)s")
 logging.getLogger("fastmcp.server.providers.aggregate").setLevel(logging.DEBUG)
+
+_proxy_logger = logging.getLogger("voitta-auth.proxy")
+
+
+TOOL_CACHE_DIR = Path.home() / ".voitta_auth_cache"
+
+
+def _cache_path(backend_name: str, kind: str) -> Path:
+    """Return the JSON cache file path for a given backend and listing kind."""
+    safe_name = re.sub(r"[^\w\-]", "_", backend_name).lower()
+    return TOOL_CACHE_DIR / f"{safe_name}_{kind}.json"
+
+
+def _proxy_tool_to_mcp_dict(item) -> dict:
+    """Convert a ProxyTool (or any Tool) to an mcp.types.Tool-compatible dict."""
+    d = item.model_dump()
+    # ProxyTool uses 'parameters'/'output_schema'; mcp.types.Tool uses 'inputSchema'/'outputSchema'
+    if "inputSchema" not in d and "parameters" in d:
+        d["inputSchema"] = d.pop("parameters")
+    if "outputSchema" not in d and "output_schema" in d:
+        d["outputSchema"] = d.pop("output_schema")
+    # Drop extra ProxyTool-only fields that mcp.types.Tool rejects
+    for extra in ("version", "tags", "task_config", "serializer", "timeout"):
+        d.pop(extra, None)
+    return d
+
+
+def _save_cache(backend_name: str, kind: str, items):
+    """Serialize MCP objects to a JSON cache file."""
+    try:
+        TOOL_CACHE_DIR.mkdir(exist_ok=True)
+        data = [_proxy_tool_to_mcp_dict(item) if kind == "tools" else item.model_dump()
+                for item in items]
+        _cache_path(backend_name, kind).write_text(
+            json.dumps(data, default=lambda o: list(o) if isinstance(o, set) else str(o))
+        )
+        _proxy_logger.info("[%s] Cached %d %s to disk", backend_name, len(data), kind)
+    except Exception as e:
+        _proxy_logger.warning("[%s] Failed to write %s cache: %s", backend_name, kind, e)
+
+
+def _load_cache(backend_name: str, kind: str, model_cls, client_factory=None):
+    """Deserialize MCP objects from a JSON cache file, or return None on miss."""
+    path = _cache_path(backend_name, kind)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        if kind == "tools" and client_factory is not None:
+            # Load as ProxyTool so run() forwards to upstream (not base Tool
+            # which raises NotImplementedError). Cache stores mcp.types.Tool
+            # format (inputSchema/outputSchema) which from_mcp_tool expects.
+            return [
+                ProxyTool.from_mcp_tool(client_factory, mcp.types.Tool.model_validate(item))
+                for item in data
+            ]
+        return [model_cls.model_validate(item) for item in data]
+    except Exception as e:
+        _proxy_logger.warning("[%s] Failed to read %s cache: %s", backend_name, kind, e)
+        return None
+
+
+class ResilientProxyProvider(ProxyProvider):
+    """ProxyProvider that catches all upstream errors instead of only McpError.
+
+    When the upstream MCP server is unreachable (not started yet, crashed, etc.),
+    tool/resource/prompt listing returns cached results (if available) or empty
+    lists.  Successful listings are persisted to disk so they survive restarts.
+    """
+
+    def __init__(self, client_factory, *, backend_name: str = "upstream", cache_listings: bool = False):
+        super().__init__(client_factory)
+        self._backend_name = backend_name
+        self._cache_listings = cache_listings
+
+    async def _list_tools(self):
+        try:
+            tools = await super()._list_tools()
+            if self._cache_listings and tools:
+                _save_cache(self._backend_name, "tools", tools)
+            return tools
+        except Exception as e:
+            _proxy_logger.warning("[%s] Upstream unavailable for tool listing: %s", self._backend_name, e)
+            if self._cache_listings:
+                cached = _load_cache(self._backend_name, "tools", mcp.types.Tool, client_factory=self.client_factory)
+                if cached is not None:
+                    _proxy_logger.info("[%s] Returning %d cached tools", self._backend_name, len(cached))
+                    return cached
+            return []
+
+    async def _list_resources(self):
+        try:
+            resources = await super()._list_resources()
+            if self._cache_listings and resources:
+                _save_cache(self._backend_name, "resources", resources)
+            return resources
+        except Exception as e:
+            _proxy_logger.warning("[%s] Upstream unavailable for resource listing: %s", self._backend_name, e)
+            if self._cache_listings:
+                cached = _load_cache(self._backend_name, "resources", mcp.types.Resource)
+                if cached is not None:
+                    _proxy_logger.info("[%s] Returning %d cached resources", self._backend_name, len(cached))
+                    return cached
+            return []
+
+    async def _list_resource_templates(self):
+        try:
+            templates = await super()._list_resource_templates()
+            if self._cache_listings and templates:
+                _save_cache(self._backend_name, "templates", templates)
+            return templates
+        except Exception as e:
+            _proxy_logger.warning("[%s] Upstream unavailable for template listing: %s", self._backend_name, e)
+            if self._cache_listings:
+                cached = _load_cache(self._backend_name, "templates", mcp.types.ResourceTemplate)
+                if cached is not None:
+                    _proxy_logger.info("[%s] Returning %d cached templates", self._backend_name, len(cached))
+                    return cached
+            return []
+
+    async def _list_prompts(self):
+        try:
+            prompts = await super()._list_prompts()
+            if self._cache_listings and prompts:
+                _save_cache(self._backend_name, "prompts", prompts)
+            return prompts
+        except Exception as e:
+            _proxy_logger.warning("[%s] Upstream unavailable for prompt listing: %s", self._backend_name, e)
+            if self._cache_listings:
+                cached = _load_cache(self._backend_name, "prompts", mcp.types.Prompt)
+                if cached is not None:
+                    _proxy_logger.info("[%s] Returning %d cached prompts", self._backend_name, len(cached))
+                    return cached
+            return []
+
+
+class ResilientFastMCPProxy(FastMCPProxy):
+    """FastMCPProxy that uses ResilientProxyProvider for graceful upstream failure handling."""
+
+    def __init__(self, *, client_factory, backend_name: str = "upstream", cache_listings: bool = False, **kwargs):
+        # Call grandparent (FastMCP) init, skipping FastMCPProxy which adds a plain ProxyProvider
+        FastMCPServer.__init__(self, **kwargs)
+        self.client_factory = client_factory
+        provider = ResilientProxyProvider(client_factory, backend_name=backend_name, cache_listings=cache_listings)
+        self.add_provider(provider)
+
+
 from AppKit import (
     NSAttributedString, NSBezierPath, NSColor, NSFont, NSFontAttributeName,
     NSForegroundColorAttributeName, NSImage, NSMutableAttributedString,
@@ -445,6 +595,10 @@ class VoittaAuthApp(rumps.App):
         menu_list.append(rumps.MenuItem("Help", callback=self.show_help))
         self.menu = menu_list
 
+        # Session tracking for tools/list_changed notifications
+        self._mcp_sessions = set()  # set of weakref to ServerSession
+        self._mcp_event_loop = None  # asyncio event loop from the proxy thread
+
         self._update_menu_state()
 
         # Start unified FastMCP proxy server
@@ -599,6 +753,38 @@ class VoittaAuthApp(rumps.App):
                     self._menu_items["jira"].title = f"Jira: {email}"
             else:
                 self._menu_items["jira"].title = "Jira: Not Configured"
+        # Notify connected MCP clients that the tool list may have changed
+        self._notify_tools_changed()
+
+    def _notify_tools_changed(self):
+        """Send notifications/tools/list_changed to all connected MCP sessions."""
+        loop = self._mcp_event_loop
+        if not loop or loop.is_closed():
+            return
+
+        # Clean up dead references and collect live sessions
+        dead = set()
+        sessions = []
+        for ref in self._mcp_sessions:
+            session = ref()
+            if session is None:
+                dead.add(ref)
+            else:
+                sessions.append(session)
+        self._mcp_sessions -= dead
+
+        if not sessions:
+            return
+
+        async def _broadcast():
+            for session in sessions:
+                try:
+                    await session.send_tool_list_changed()
+                except Exception:
+                    pass
+
+        asyncio.run_coroutine_threadsafe(_broadcast(), loop)
+        print(f"[voitta-auth] Sent tools/list_changed to {len(sessions)} session(s)")
 
     def _make_toggle_callback(self, provider_key):
         def callback(_):
@@ -1291,16 +1477,19 @@ class VoittaAuthApp(rumps.App):
         main_server = FastMCPServer("voitta-auth")
 
         # RAG proxy with dynamic per-provider auth headers
-        rag_proxy = FastMCPProxy(
+        rag_proxy = ResilientFastMCPProxy(
             client_factory=self._make_rag_client_factory(),
             name="voitta-rag",
+            backend_name="RAG",
         )
         main_server.mount(rag_proxy, prefix="voitta_rag")
 
         # Google Workspace proxy with dynamic Bearer token
-        google_proxy = FastMCPProxy(
+        google_proxy = ResilientFastMCPProxy(
             client_factory=self._make_google_client_factory(),
             name="google-sheets",
+            backend_name="Google Workspace",
+            cache_listings=True,
         )
         main_server.mount(google_proxy, prefix="google_sheets")
 
@@ -1310,6 +1499,55 @@ class VoittaAuthApp(rumps.App):
             name="jira",
         )
         main_server.mount(jira_proxy, prefix="jira")
+
+        # Patch LowLevelServer.run to track active sessions for tools/list_changed
+        app_ref = self
+        original_run = main_server._mcp_server.run
+
+        async def tracking_run(read_stream, write_stream, initialization_options, **kwargs):
+            # Capture the event loop on first session
+            app_ref._mcp_event_loop = asyncio.get_running_loop()
+            # Wrap write_stream to intercept session creation
+            # We hook into the original run and track the session via the lifespan
+            from fastmcp.server.low_level import MiddlewareServerSession
+            from contextlib import AsyncExitStack
+            import anyio
+
+            async with AsyncExitStack() as stack:
+                lifespan_context = await stack.enter_async_context(
+                    main_server._mcp_server.lifespan(main_server._mcp_server)
+                )
+                session = await stack.enter_async_context(
+                    MiddlewareServerSession(
+                        main_server._mcp_server.fastmcp,
+                        read_stream,
+                        write_stream,
+                        initialization_options,
+                        stateless=kwargs.get("stateless", False),
+                    )
+                )
+
+                # Track this session
+                ref = weakref.ref(session)
+                app_ref._mcp_sessions.add(ref)
+                print(f"[voitta-auth] MCP session connected (total: {len(app_ref._mcp_sessions)})")
+
+                try:
+                    async with anyio.create_task_group() as tg:
+                        session._subscription_task_group = tg
+                        async for message in session.incoming_messages:
+                            tg.start_soon(
+                                main_server._mcp_server._handle_message,
+                                message,
+                                session,
+                                lifespan_context,
+                                kwargs.get("raise_exceptions", False),
+                            )
+                finally:
+                    app_ref._mcp_sessions.discard(ref)
+                    print(f"[voitta-auth] MCP session disconnected (total: {len(app_ref._mcp_sessions)})")
+
+        main_server._mcp_server.run = tracking_run
 
         print(f"[voitta-auth] FastMCP proxy on http://127.0.0.1:{PROXY_PORT}/mcp")
         print(f"[voitta-auth]   RAG → {self.voitta_rag_url}")
