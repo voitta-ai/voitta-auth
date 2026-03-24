@@ -1213,9 +1213,13 @@ class VoittaAuthApp(rumps.App):
         # Google Workspace MCP
         if Path(GOOGLE_MCP_DIR).is_dir():
             try:
+                # Derive port from edit_proxy_url so subprocess matches what the proxy connects to
+                google_port = str(urlparse(self.edit_proxy_url).port or GOOGLE_MCP_PORT)
+                env = {**os.environ, "PORT": google_port}
                 proc = subprocess.Popen(
-                    ["uv", "run", "main.py", "--transport", "streamable-http", "--port", str(GOOGLE_MCP_PORT)],
+                    ["uv", "run", "main.py", "--transport", "streamable-http"],
                     cwd=GOOGLE_MCP_DIR,
+                    env=env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -1403,6 +1407,39 @@ class _SettingsTitleObserver(NSObject):
             return
         title = obj.title()
         if not title:
+            return
+
+        if title.startswith("VOITTA_FETCH_JIRA_PROJECTS:"):
+            # Decode base64 payload: "url|email|token"
+            payload = title.split(":", 1)[1]
+            try:
+                decoded = base64.b64decode(payload).decode("utf-8")
+                url, email, token = decoded.split("|", 2)
+            except Exception as e:
+                js = f"_setJiraProjectsError('Bad request')"
+                obj.evaluateJavaScript_completionHandler_(js, None)
+                return
+            # Reset title so the next signal is observed
+            obj.evaluateJavaScript_completionHandler_(
+                "document.title = 'Voitta Auth — Settings'", None
+            )
+            # Fetch in a background thread to avoid blocking the UI
+            webview_ref = obj
+
+            def _do_fetch():
+                try:
+                    projects = _fetch_jira_projects(url, email, token)
+                    projects_json = json.dumps(projects)
+                    js = f"_setJiraProjects({projects_json})"
+                except Exception as e:
+                    js = f"_setJiraProjectsError({json.dumps(str(e))})"
+                # Dispatch back to main thread
+                from PyObjCTools import AppHelper
+                AppHelper.callAfter(
+                    lambda: webview_ref.evaluateJavaScript_completionHandler_(js, None)
+                )
+
+            threading.Thread(target=_do_fetch, daemon=True).start()
             return
 
         if title == "VOITTA_SAVE":

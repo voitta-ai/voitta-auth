@@ -203,8 +203,10 @@
     <input type="password" id="jira_api_token" placeholder="API token">
   </div>
   <div class="field">
-    <label>Project</label>
-    <input type="text" id="jira_project" placeholder="PROJ">
+    <label>Project(s)</label>
+    <select id="jira_project" multiple style="flex:1; min-height:80px; padding:4px; border:1px solid var(--input-border); border-radius:6px; background:var(--input-bg); color:var(--text); font-size:12px; font-family:ui-monospace,'SF Mono',monospace;">
+    </select>
+    <span id="jira_project_status" style="font-size:11px; color:var(--text-secondary); min-width:60px; text-align:center;"></span>
   </div>
 </div>
 
@@ -331,7 +333,50 @@ function loadJira() {
   document.getElementById('jira_url').value = config.jira.server_url || '';
   document.getElementById('jira_email').value = config.jira.email || '';
   document.getElementById('jira_api_token').value = config.jira.api_token || '';
-  document.getElementById('jira_project').value = config.jira.project || '';
+
+  // Attach change listeners to trigger project fetch
+  ['jira_url', 'jira_email', 'jira_api_token'].forEach(id => {
+    const el = document.getElementById(id);
+    el.addEventListener('change', maybeLoadProjects);
+    el.addEventListener('blur', maybeLoadProjects);
+  });
+
+  // Load projects if credentials already present
+  maybeLoadProjects();
+}
+
+var _lastFetchKey = '';
+function maybeLoadProjects() {
+  const url = document.getElementById('jira_url').value.trim();
+  const email = document.getElementById('jira_email').value.trim();
+  const token = document.getElementById('jira_api_token').value.trim();
+  const key = url + '|' + email + '|' + token;
+  if (!url || !email || !token) return;
+  if (key === _lastFetchKey) return;
+  _lastFetchKey = key;
+  document.getElementById('jira_project_status').textContent = 'Loading\u2026';
+  // Signal Python to fetch projects via title KVO
+  document.title = 'VOITTA_FETCH_JIRA_PROJECTS:' + btoa(unescape(encodeURIComponent(key)));
+}
+
+// Called from Python after fetching projects
+function _setJiraProjects(projects) {
+  const sel = document.getElementById('jira_project');
+  const saved = (config.jira.project || '').split(',').map(s => s.trim()).filter(Boolean);
+  sel.innerHTML = '';
+  projects.forEach(function(p) {
+    const opt = document.createElement('option');
+    opt.value = p[0];
+    opt.textContent = p[0] + ' \u2014 ' + p[1];
+    if (saved.includes(p[0])) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  const status = document.getElementById('jira_project_status');
+  status.textContent = projects.length ? projects.length + ' found' : 'None found';
+}
+
+function _setJiraProjectsError(msg) {
+  document.getElementById('jira_project_status').textContent = msg;
 }
 
 function loadProxy() {
@@ -342,11 +387,13 @@ function loadProxy() {
 
 function collectAll() {
   // Re-read input values that might have changed without onchange firing
+  const selProj = document.getElementById('jira_project');
+  const selectedProjects = Array.from(selProj.selectedOptions).map(o => o.value).join(',');
   config.jira = {
     server_url: document.getElementById('jira_url').value,
     email: document.getElementById('jira_email').value,
     api_token: document.getElementById('jira_api_token').value,
-    project: document.getElementById('jira_project').value,
+    project: selectedProjects,
   };
   config.proxy = {
     port: parseInt(document.getElementById('proxy_port').value) || 18765,
